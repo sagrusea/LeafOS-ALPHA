@@ -10,8 +10,6 @@ disk_load:
 
     jc .disk_error
     pop dx
-    cmp dh, al
-    jne .disk_error
     ret
 
 .disk_error:
