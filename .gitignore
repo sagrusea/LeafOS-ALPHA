@@ -3,7 +3,7 @@
 roadMap.md
 i686-leafos.json
 rust-toolchain.toml
-
+.vscode
 # Added by cargo
 
-/target
+src/kernel/target

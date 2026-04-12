@@ -1,0 +1,17 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[[bin]]
+name = "blog_os"
+test = false
+bench = false
