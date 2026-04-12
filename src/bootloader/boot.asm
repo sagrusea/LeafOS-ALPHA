@@ -3,7 +3,7 @@
 mov [BOOT_DRIVE], dl
 
 mov si, msg
-call print_string
+call print_string16
 
 mov bx, 0x7e00
 mov dh, 1

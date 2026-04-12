@@ -1,3 +1,9 @@
 *img
 *bin
 roadMap.md
+i686-leafos.json
+rust-toolchain.toml
+
+# Added by cargo
+
+/target
