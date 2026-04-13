@@ -1,5 +1,10 @@
 disk_load:
     push dx
+
+    xor ax, ax
+    int 0x13
+    jc .disk_error
+
     mov ah, 0x02
     mov al, dh
     mov ch, 0x00
@@ -15,6 +20,9 @@ disk_load:
 .disk_error:
     mov si, ERR_MSG
     call print_string16
+    mov bl, ah
+    mov bh, 0x00
+    call print_hex
     jmp $
 
 ERR_MSG: db 'DriveERR', 0

@@ -6,7 +6,7 @@ mov si, msg
 call print_string16
 
 mov bx, 0x7e00
-mov dh, 1
+mov dh, 2
 mov dl, [BOOT_DRIVE]
 call disk_load
 
@@ -19,7 +19,7 @@ BOOT_DRIVE: db 0
 msg: db "LeafOS",0
 
 
-%include "print.asm"
-%include "disk.asm"
+%include "./src/bootloader/print.asm"
+%include "./src/bootloader/disk.asm"
 times 510-($-$$) db 0
 dw 0xaa55

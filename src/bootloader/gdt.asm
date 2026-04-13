@@ -30,3 +30,4 @@ GDTEnd:
 GDTDescriptor:
     dw GDTEnd - GDTStart - 1
     dd GDTStart
+    
