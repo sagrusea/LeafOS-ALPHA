@@ -35,16 +35,7 @@ init_pm:
 
 begin_pm:
 
-    call clear_screen
-    
-    mov ebx, MSG_32_MODE
-    call print_string_32
-
     call 0x8000
     jmp $
-
-
-%include "src/bootloader/print32.asm"
-MSG_32_MODE: db "Now in 32 bits", 0
 
 times 512-($-$$) db 0

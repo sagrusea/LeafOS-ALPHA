@@ -1,5 +1,6 @@
 *img
 *bin
+*ld
 roadMap.md
 i686-leafos.json
 rust-toolchain.toml
@@ -7,3 +8,4 @@ rust-toolchain.toml
 # Added by cargo
 
 src/kernel/target
+*ps1

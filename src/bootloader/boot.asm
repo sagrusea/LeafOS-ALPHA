@@ -1,12 +1,11 @@
 [org 0x7c00]
-
 mov [BOOT_DRIVE], dl
 
 mov si, msg
 call print_string16
 
 mov bx, 0x7e00
-mov dh, 2
+mov dh, 43
 mov dl, [BOOT_DRIVE]
 call disk_load
 
