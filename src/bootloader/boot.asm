@@ -14,7 +14,7 @@ mov si, msg
 call print_string16
 
 mov bx, 0x7e00
-mov dh, 43
+mov dh, 60
 mov dl, [BOOT_DRIVE]
 call disk_load
 

@@ -1,4 +1,12 @@
 use core::fmt;
+use spin::Mutex;
+use spin::lazy::Lazy;
+
+pub static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| Mutex::new(Writer {
+    column_position: 0,
+    color_code: ColorCode::new(Color::Yellow, Color::Black),
+    buffer: unsafe { &mut *(0xb8000 as *mut Buffer) }, 
+}));
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,15 +92,20 @@ impl Writer {
                 // printable ASCII byte or newline
                 0x20..=0x7e | b'\n' => self.write_byte(byte),
                 // not part of printable ASCII range
-                _ => self.write_byte(0xfe),
+                _ => self.write_byte(b'?'),
             }
         }
     }
     fn new_line(&mut self) {
         for row in 1..BUFFER_HEIGHT {
             for col in 0..BUFFER_WIDTH {
-                let character = self.buffer.chars[row][col].read();
-                self.buffer.chars[row - 1][col].write(character);
+                unsafe {
+                    let ptr_src = &self.buffer.chars[row][col] as *const ScreenChar;
+                    let character = core::ptr::read_volatile(ptr_src);
+
+                    let ptr_dst = &mut self.buffer.chars[row - 1][col] as *mut ScreenChar;
+                    core::ptr::write_volatile(ptr_dst, character);
+                }
             }
         }
         self.clear_row(BUFFER_HEIGHT - 1);
@@ -104,7 +117,10 @@ impl Writer {
             color_code: self.color_code,
         };
         for col in 0..BUFFER_WIDTH {
-            self.buffer.chars[row][col].write(blank);
+            unsafe {
+                let ptr = &mut self.buffer.chars[row][col] as *mut ScreenChar;
+                core::ptr::write_volatile(ptr, blank);
+            }
         }
     }
 }
@@ -116,20 +132,19 @@ impl fmt::Write for Writer {
     }
 }
 
-pub fn print_idk() {
-    use core::fmt::Write;
-    let mut writer = Writer {
-        column_position: 0,
-        color_code: ColorCode::new(Color::Cyan, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
-    };
-
-    writer.write_byte(b'L');
-    write!(writer, "The numbers are {} and {}", 42, 1.0/3.0).unwrap();
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::vga_buffer::_print(format_args!($($arg)*)));
 }
 
-pub static WRITER: Writer = Writer {
-    column_position: 0,
-    color_code: ColorCode::new(Color::Yellow, Color::Black),
-    buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
-};
+#[macro_export]
+macro_rules! println {
+    () => ($crate::print!("\n"));
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    WRITER.lock().write_fmt(args).unwrap();
+}

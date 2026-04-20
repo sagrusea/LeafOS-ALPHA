@@ -1,14 +1,20 @@
 [org 0x7e00]
+stage_2_top:
 [bits 16]
 
-section .stage2_entry
-global stage_2
 stage_2:
-    cli
+    ;mov eax, 0xE820
+    ;int 0x15
+
     xor ax, ax
     mov ds, ax
     mov es, ax
 
+    in al, 0x92
+    or al, 2
+    out 0x92, al
+
+    cli
     lgdt [GDTDescriptor]
 
     mov eax, cr0
@@ -16,8 +22,6 @@ stage_2:
     mov cr0, eax
 
     jmp 0x08:init_pm
-
-    %include "src/bootloader/gdt.asm"
 
 [bits 32]
 init_pm:
@@ -34,8 +38,9 @@ init_pm:
     call begin_pm
 
 begin_pm:
-
-    call 0x8000
+    jmp 0x8000
     jmp $
 
-times 512-($-$$) db 0
+%include "src/bootloader/gdt.asm"
+
+times 512-($-stage_2_top) db 0

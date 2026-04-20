@@ -7,12 +7,14 @@ mod vga_buffer;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
-    vga_buffer::print_idk();
-
+    println!("Welcome to LeafOS $@<^~)v:{}", 0.1);
+    panic!("help");
     loop {}
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    println!("--Kernel Panic--");
+    
     loop {}
 }
