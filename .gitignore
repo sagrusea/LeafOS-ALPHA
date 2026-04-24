@@ -2,6 +2,7 @@
 *bin
 *ld
 *ps1
+*bat
 roadMap.md
 i686-leafos.json
 rust-toolchain.toml

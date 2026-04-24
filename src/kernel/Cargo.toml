@@ -5,13 +5,22 @@ edition = "2024"
 
 [dependencies]
 spin = "0.9.8"
+x86 = "0.52.0"
+uart_16550 = "0.6.0"
 
 [profile.dev]
-panic = "abort"
 
+[profile.test]
+opt-level = 1
+debug = false 
 [profile.release]
-panic = "abort"
+
 lto = true
 codegen-units = 1
 strip = "symbols"
-opt-level = "z"
+opt-level = 1
+
+[[bin]]
+name = "kernel"
+test = true
+bench = false

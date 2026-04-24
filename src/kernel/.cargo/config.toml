@@ -7,6 +7,8 @@ build-std-features = ["compiler-builtins-mem"]
 json-target-spec = true
 
 [target.x86_32-leafos]
+runner = "./test.bat"
 rustflags = [
     "-C", "link-arg=-T../../linker.ld",
 ]
+
