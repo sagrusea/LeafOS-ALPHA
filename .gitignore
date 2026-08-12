@@ -3,9 +3,12 @@
 *ld
 *ps1
 *bat
+*sh
+*ld2
 roadMap.md
 i686-leafos.json
 rust-toolchain.toml
+test
 .vscode
 # Added by cargo
 
