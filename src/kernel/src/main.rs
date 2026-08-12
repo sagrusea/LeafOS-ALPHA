@@ -10,6 +10,8 @@ use core::panic::PanicInfo;
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
 
+    println!("Welcome to LeafOS v:{}", 0.1);
+    
     #[cfg(test)]
     test_main();
 

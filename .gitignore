@@ -5,6 +5,7 @@
 *bat
 *sh
 *ld2
+*efi
 roadMap.md
 i686-leafos.json
 rust-toolchain.toml

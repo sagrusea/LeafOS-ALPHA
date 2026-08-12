@@ -1,5 +1,5 @@
 /**
- * @file efi_bootloader.h
+ * @file boot.h
  * @brief Core UEFI Bootloader Definitions, Types, and Protocol Abstractions
  * 
  * This header provides a self-contained set of definitions for writing
@@ -8,8 +8,8 @@
  * SPDX-License-Identifier: MIT OR BSD-2-Clause-Patent
  */
 
-#ifndef EFI_BOOTLOADER_H
-#define EFI_BOOTLOADER_H
+#ifndef BOOT_H
+#define BOOT_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,7 +92,7 @@ typedef struct {
     EFI_GUID(0x5B1B31A1, 0x9562, 0x11D2, 0x8E, 0x3F, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B)
 
 #define EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID \
-    EFI_GUID(0x0964E5B2, 0x2A38, 0x4F2E, 0xBE, 0x56, 0xAC, 0xD7, 0x5A, 0xAE, 0x0B, 0x29)
+    EFI_GUID(0x964E5B22, 0x6459, 0x11D2, 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B)
 
 #define EFI_FILE_INFO_GUID \
     EFI_GUID(0x09576E92, 0x6D3F, 0x11D2, 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B)
@@ -172,6 +172,12 @@ typedef struct {
     UINT32 Reserved;
 } EFI_TABLE_HEADER;
 
+typedef enum {
+    AllHandles,
+    ByRegisterNotify,
+    ByProtocol
+} EFI_LOCATE_SEARCH_TYPE;
+
 /* Forward declarations for protocol interfaces */
 typedef struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL;
 typedef struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL  EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
@@ -240,6 +246,58 @@ struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
 
 #define EFI_TEXT_ATTR(Foreground, Background) \
     ((Foreground) | ((Background) << 4))
+
+/* --- Graphics Output Protocol (GOP) --- */
+typedef enum {
+    PixelRedGreenBlueReserved8BitPerColor,
+    PixelBlueGreenRedReserved8BitPerColor,
+    PixelBitMask,
+    PixelBltOnly,
+    PixelFormatMax
+} EFI_GRAPHICS_PIXEL_FORMAT;
+
+typedef struct {
+    UINT32 RedMask;
+    UINT32 GreenMask;
+    UINT32 BlueMask;
+    UINT32 ReservedMask;
+} EFI_PIXEL_BITMASK;
+
+typedef struct {
+    UINT32                     Version;
+    UINT32                     HorizontalResolution;
+    UINT32                     VerticalResolution;
+    EFI_GRAPHICS_PIXEL_FORMAT  PixelFormat;
+    EFI_PIXEL_BITMASK          PixelInformation;
+    UINT32                     PixelsPerScanLine;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
+typedef struct {
+    UINT32                                 MaxMode;
+    UINT32                                 Mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION   *Info;
+    UINTN                                  SizeOfInfo;
+    EFI_PHYSICAL_ADDRESS                   FrameBufferBase;
+    UINTN                                  FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+
+typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
+    EFI_STATUS (*QueryMode)(
+        EFI_GRAPHICS_OUTPUT_PROTOCOL *This,
+        UINT32 ModeNumber,
+        UINTN *SizeOfInfo,
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **Info
+    );
+    EFI_STATUS (*SetMode)(
+        EFI_GRAPHICS_OUTPUT_PROTOCOL *This,
+        UINT32 ModeNumber
+    );
+    /* Blt() omitted -- not needed once we write to FrameBufferBase directly */
+    VOID *Blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
+};
 
 /* --- Loaded Image Protocol --- */
 typedef struct {
@@ -318,7 +376,13 @@ struct _EFI_BOOT_SERVICES {
 
     /* Library */
     VOID *ProtocolsPerHandle;
-    VOID *LocateHandleBuffer;
+    EFI_STATUS (*LocateHandleBuffer)(
+        EFI_LOCATE_SEARCH_TYPE SearchType,
+        EFI_GUID *Protocol,
+        VOID *SearchKey,
+        UINTN *NoHandles,
+        EFI_HANDLE **Buffer
+    );
     EFI_STATUS (*LocateProtocol)(EFI_GUID *Protocol, VOID *Registration, VOID **Interface);
     VOID *InstallMultipleProtocolInterfaces;
     VOID *UninstallMultipleProtocolInterfaces;

@@ -7,6 +7,8 @@
 use core::panic::PanicInfo;
 use x86::io::outl;
 
+pub mod boot_info;
+pub mod framebuffer;
 pub mod vga_buffer;
 pub mod serial;
 
