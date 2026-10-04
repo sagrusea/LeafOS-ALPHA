@@ -4,25 +4,58 @@
 #![test_runner(kernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
-use kernel::println;
 use core::panic::PanicInfo;
+use kernel::boot_info::BootInfo;
+use kernel::framebuffer::{self, FramebufferInfo};
+use kernel::{gop_println, serial_println};
+
 
 #[unsafe(no_mangle)]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
-    println!("Welcome to LeafOS v:{}", 0.1);
-    
-    #[cfg(test)]
-    test_main();
+    serial_println!("LeafOS kernel entered, boot_info={:p}", boot_info);
 
-    loop{}
+    let boot_info = unsafe { BootInfo::from_ptr(boot_info) };
+
+
+    let framebuffer = boot_info.and_then(|info| unsafe { FramebufferInfo::from_boot_info(info) });
+
+    match framebuffer {
+        Some(fb_info) => {
+            serial_println!(
+                "Framebuffer {}x{} @ {:#x}",
+                fb_info.width,
+                fb_info.height,
+                fb_info.buffer.addr()
+            );
+            framebuffer::init(fb_info);
+            gop_println!("LEAFOS V0.1");
+            gop_println!("KERNEL BOOT OK");
+        }
+        None => {
+            serial_println!("[WARN] No usable framebuffer -- BootInfo missing/invalid or GOP unavailable");
+        }
+    }
+
+    loop {}
 }
 
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    println!("--Kernel Panic--");
-    println!("{}", info.message());
+    serial_println!("--Kernel Panic--");
+    serial_println!("{}", info.message());
+    if framebuffer::is_initialized() {
+        gop_println!("--KERNEL PANIC--");
+    }
+    loop {}
+}
+
+
+#[cfg(test)]
+#[unsafe(no_mangle)]
+pub extern "C" fn _start() -> ! {
+    test_main();
     loop {}
 }
 

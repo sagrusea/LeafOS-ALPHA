@@ -1,5 +1,3 @@
-use core::num::FpCategory::Infinite;
-
 const BOOT_INFO_MAGIC: u64 = 0x5255_5354_424F_4F54;
 
 pub const PIXEL_FORMAT_RGB: u32 = 0;

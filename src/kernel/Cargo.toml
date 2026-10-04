@@ -25,3 +25,7 @@ opt-level = 1
 name = "kernel"
 test = false
 bench = false
+
+[[test]]
+name = "should_panic"
+harness = false
