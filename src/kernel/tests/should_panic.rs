@@ -9,6 +9,7 @@ use kernel::{QemuExitCode::{self, Success}, exit_qemu, serial_print, serial_prin
 use kernel::gop_print;
 
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start() -> ! {
     should_fail();
     serial_println!("[test did not panic]");
