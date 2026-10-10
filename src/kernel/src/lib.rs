@@ -1,6 +1,7 @@
 #![no_std]
 #![cfg_attr(test, no_main)]
 #![feature(custom_test_frameworks)]
+#![feature(abi_x86_interrupt)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
@@ -11,6 +12,7 @@ pub mod boot_info;
 pub mod framebuffer;
 pub mod vga_buffer;
 pub mod serial;
+pub mod interrupts;
 
 pub trait Testable {
     fn run(&self) -> ();
@@ -66,4 +68,12 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
     unsafe {
         outl(0xf4, exit_code as u32);
     }
+}
+
+pub fn init() {
+    interrupts::init_idt();
+}
+
+pub mod misc {
+    pub mod font;
 }

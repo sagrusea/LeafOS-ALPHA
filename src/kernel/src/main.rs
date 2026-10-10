@@ -29,13 +29,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 fb_info.buffer.addr()
             );
             framebuffer::init(fb_info);
-            gop_println!("LEAFOS V0.1");
+            gop_println!("LEAFOS ALPHA build");
             gop_println!("KERNEL BOOT OK");
         }
         None => {
             serial_println!("[WARN] No usable framebuffer -- BootInfo missing/invalid or GOP unavailable");
         }
     }
+    kernel::init();
+    x86_64::instructions::interrupts::int3();
 
     loop {}
 }
