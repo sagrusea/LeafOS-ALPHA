@@ -56,7 +56,7 @@ impl Pic8259 {
             self.slave_data.write(ICW4_8086_MODE);
             io_wait();
 
-            self.master_data.write(0xFE);
+            self.master_data.write(0xFC);
             io_wait();
             self.slave_data.write(0xFF);
             io_wait();

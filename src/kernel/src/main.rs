@@ -38,11 +38,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     kernel::init();
 
     gop_println!("NO CRASH!");
-    loop {
-        gop_print!("-")
-    }
 
-    loop {}
+    kernel::hlt_loop();
 }
 
 #[cfg(not(test))]
@@ -54,7 +51,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         gop_println!("--KERNEL PANIC--");
         gop_println!("{}", info.message());
     }
-    loop {}
+    kernel::hlt_loop();
 }
 
 

@@ -1,5 +1,7 @@
+use spin::Mutex;
 use x86_64::structures::idt::{InterruptDescriptorTable,InterruptStackFrame};
 use crate::drivers::Pic8259;
+use crate::drivers::keyboard;
 use crate::gop_print;
 use crate::gop_println;
 use crate::gdt;
@@ -13,6 +15,7 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 #[repr(u8)]
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
+    Keyboard,
 }
 
 impl InterruptIndex {
@@ -30,7 +33,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[InterruptIndex::Timer.as_u8()]
         .set_handler_fn(timer_interrupt_handler);
-
+    idt[InterruptIndex::Keyboard.as_u8()]
+        .set_handler_fn(keyboard_interrupt_handler);
     idt
 });
 
@@ -53,11 +57,46 @@ extern "x86-interrupt" fn double_fault_handler(
 extern "x86-interrupt" fn timer_interrupt_handler(
     _stack_frame: InterruptStackFrame,
 ) {
-    gop_print!(".");
+    //gop_print!(".");
 
     unsafe {
         PICS.lock()
             .signal_eoi(InterruptIndex::Timer.as_u8() - PIC_1_OFFSET);
+    }
+}
+
+extern "x86-interrupt" fn keyboard_interrupt_handler(
+    _stack_frame: InterruptStackFrame)
+{
+    use x86_64::instructions::port::Port;
+    use crate::drivers::{Keyboard, KeyState};
+
+    static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
+
+    let mut port = Port::new(0x60);
+    let scancode: u8 = unsafe { port.read() };
+
+    let mut keyboard = KEYBOARD.lock();
+
+    if let Some(event) = keyboard.process_scancode(scancode) {
+        if event.state == KeyState::Pressed {
+            if let Some(byte) = event.ascii {
+                match byte {
+                    b'\n' => gop_print!("\n"),
+                    0x08 => gop_print!("\x08"),
+                    0x1B => gop_print!("\x1B"),
+                    0x20..=0x7E => gop_print!("{}", byte as char),
+                    _ => {}
+                }
+            } else {
+                gop_print!("{:?}", event.code);
+            }
+        }
+    }
+
+    unsafe {
+        PICS.lock()
+            .signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
     }
 }
 
