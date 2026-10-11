@@ -220,17 +220,21 @@ pub fn is_initialized() -> bool {
 }
 
 pub fn set_color(r: u8, g: u8, b: u8) {
-    if let Some(writer) = WRITER.get() {
-        writer.lock().set_color(r, g, b);
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().set_color(r, g, b);
+        }
+    });
 }
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    if let Some(writer) = WRITER.get() {
-        use core::fmt::Write;
-        writer.lock().write_fmt(args).ok();
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            use core::fmt::Write;
+            writer.lock().write_fmt(args).ok();
+        }
+    });
 }
 
 #[macro_export]
@@ -242,4 +246,108 @@ macro_rules! gop_print {
 macro_rules! gop_println {
     () => ($crate::gop_print!("\n"));
     ($($arg:tt)*) => ($crate::gop_print!("{}\n", format_args!($($arg)*)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_WIDTH: usize = 640;
+    const TEST_HEIGHT: usize = 480;
+    const TEST_STRIDE: usize = TEST_WIDTH * 4;
+
+    static mut TEST_BUFFER: [u8; TEST_STRIDE * TEST_HEIGHT] =
+        [0; TEST_STRIDE * TEST_HEIGHT];
+
+    fn init_test_framebuffer() {
+        let buffer = unsafe {
+            FramebufferBuffer::new(
+                core::ptr::addr_of_mut!(TEST_BUFFER).cast::<u8>(),
+                TEST_STRIDE * TEST_HEIGHT,
+            )
+            .expect("test framebuffer pointer must not be null")
+        };
+
+        init(FramebufferInfo {
+            buffer,
+            width: TEST_WIDTH,
+            height: TEST_HEIGHT,
+            stride: TEST_STRIDE,
+            bytes_per_pixel: 4,
+            bgr: false,
+        });
+    }
+
+    fn reset_writer() {
+        WRITER
+            .get()
+            .expect("test framebuffer must be initialized")
+            .lock()
+            .clear();
+    }
+
+    #[test_case]
+    fn test_gop_println_simple() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            gop_println!("test_gop_println_simple output");
+
+            let writer = WRITER.get().unwrap().lock();
+            assert_eq!(writer.x, MARGIN);
+            assert_eq!(writer.y, MARGIN + LINE_HEIGHT);
+        });
+    }
+
+    #[test_case]
+    fn test_gop_println_many() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            for _ in 0..200 {
+                gop_println!("test_gop_println_many output");
+            }
+
+            let writer = WRITER.get().unwrap().lock();
+            assert_eq!(writer.x, MARGIN);
+            assert_eq!(writer.y, TEST_HEIGHT - MARGIN - LINE_HEIGHT);
+        });
+    }
+
+    #[test_case]
+    fn test_gop_println_output() {
+        init_test_framebuffer();
+        let text = "Some test string that fits on a single line";
+
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            gop_println!("{}", text);
+
+            let writer = WRITER.get().unwrap().lock();
+            assert_eq!(writer.y, MARGIN + LINE_HEIGHT);
+
+            for (char_index, byte) in text.bytes().enumerate() {
+                let glyph = get_glyph(byte);
+                for (row, glyph_row) in glyph.iter().enumerate() {
+                    for col in 0..CHAR_WIDTH {
+                        let expected_green = (glyph_row >> (7 - col)) & 1 == 1;
+                        let pixel_offset = (MARGIN + row) * writer.info.stride
+                            + (MARGIN + char_index * CHAR_WIDTH + col)
+                                * writer.info.bytes_per_pixel;
+                        let green = unsafe {
+                            writer
+                                .info
+                                .buffer
+                                .ptr
+                                .as_ptr()
+                                .add(pixel_offset + 1)
+                                .read_volatile()
+                        };
+
+                        assert_eq!(green == DEFAULT_FG.1, expected_green);
+                    }
+                }
+            }
+        });
+    }
 }

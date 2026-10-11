@@ -27,7 +27,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 fb_info.buffer.addr()
             );
             framebuffer::init(fb_info);
-            gop_println!("LEAFOS ALPHA build 0A");
+            gop_println!("LEAFOS ALPHA build 1A");
             gop_println!("KERNEL BOOT OK");
         }
         None => {
@@ -37,12 +37,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     kernel::init();
 
-    fn stack_overflow() { 
-        stack_overflow();
+    gop_println!("NO CRASH!");
+    loop {
+        gop_print!("-")
     }
-
-    stack_overflow();
-    gop_print!("NO CRASH!");
 
     loop {}
 }
