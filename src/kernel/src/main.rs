@@ -27,7 +27,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 fb_info.buffer.addr()
             );
             framebuffer::init(fb_info);
-            gop_println!("LEAFOS ALPHA build 1A");
+            gop_println!("LEAFOS ALPHA build 2A0");
             gop_println!("KERNEL BOOT OK");
         }
         None => {
