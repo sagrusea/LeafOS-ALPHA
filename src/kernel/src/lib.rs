@@ -9,20 +9,22 @@ use core::panic::PanicInfo;
 use x86::io::outl;
 
 pub mod boot_info;
-pub mod framebuffer;
-pub mod vga_buffer;
-pub mod serial;
-pub mod interrupts;
-pub mod gdt;
 pub mod drivers;
+pub mod framebuffer;
+pub mod gdt;
+pub mod heap;
+pub mod interrupts;
+pub mod memory;
+pub mod serial;
+pub mod vga_buffer;
 
 pub trait Testable {
     fn run(&self) -> ();
 }
 
-impl<T> Testable for T 
+impl<T> Testable for T
 where
-    T:Fn(),
+    T: Fn(),
 {
     fn run(&self) -> () {
         serial_print!("{}...\t", core::any::type_name::<T>());

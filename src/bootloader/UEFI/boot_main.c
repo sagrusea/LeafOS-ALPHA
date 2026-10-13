@@ -10,6 +10,30 @@
 
 /* Your Rust kernel will be loaded/reserved at 2 MiB. */
 #define KERNEL_BASE_ADDRESS     0x00200000ULL
+#define PAGE_TABLE_ENTRY_PRESENT 0x001ULL
+#define PAGE_TABLE_ENTRY_WRITABLE 0x002ULL
+#define PAGE_TABLE_ENTRY_HUGE    0x080ULL
+#define PAGE_TABLE_ADDRESS_MASK  0x000FFFFFFFFFF000ULL
+#define PAGE_TABLE_ENTRY_COUNT   512
+#define PAGE_TABLE_ENTRY_NO_EXECUTE (1ULL << 63)
+#define PAGE_TABLE_SIZE          4096ULL
+#define HUGE_PAGE_SIZE           (2ULL * 1024 * 1024)
+#define PHYSICAL_MAP_WINDOW_SIZE (512ULL * 1024 * 1024 * 1024)
+#define EFI_LOADER_CODE_TYPE 1
+#define EFI_LOADER_DATA_TYPE 2
+#define EFI_BOOT_SERVICES_CODE_TYPE 3
+#define EFI_BOOT_SERVICES_DATA_TYPE 4
+#define EFI_RUNTIME_SERVICES_CODE_TYPE 5
+#define EFI_RUNTIME_SERVICES_DATA_TYPE 6
+#define EFI_CONVENTIONAL_MEMORY_TYPE 7
+#define EFI_ACPI_RECLAIM_MEMORY_TYPE 9
+#define EFI_ACPI_NVS_TYPE 10
+#define EFI_PAL_CODE_TYPE 13
+#define EFI_PERSISTENT_MEMORY_TYPE 14
+
+#ifndef EFI_OUT_OF_RESOURCES
+#define EFI_OUT_OF_RESOURCES 0x8000000000000009ULL
+#endif
 
 /*
  * Reserve space for kernel + BSS.
@@ -195,6 +219,8 @@ typedef struct {
     UINT64 KernelBase;
     UINT64 KernelFileSize;
     UINT64 KernelReservedSize;
+    UINT64 PageTableRoot;
+    UINT64 PhysicalMemoryOffset;
 
     /* Graphics Output Protocol framebuffer, valid only if FramebufferBase != 0 */
     UINT64 FramebufferBase;
@@ -212,6 +238,10 @@ typedef struct {
 EFI_SYSTEM_TABLE *gST = NULL;
 EFI_BOOT_SERVICES *gBS = NULL;
 EFI_HANDLE gImageHandle = NULL;
+static EFI_PHYSICAL_ADDRESS gOriginalPageTableRoot = 0;
+static EFI_PHYSICAL_ADDRESS gKernelPageTableRoot = 0;
+static EFI_PHYSICAL_ADDRESS gPhysicalMemoryOffset = 0;
+static UINTN gPhysicalMemoryPml4Index = 0;
 
 /* ========================================================================== */
 /*                                 HELPERS                                    */
@@ -224,6 +254,404 @@ static VOID ZeroMemory(volatile VOID *Destination, UINTN Size)
     while (Size--) {
         *p++ = 0;
     }
+}
+
+static EFI_STATUS ClonePageTableLevel(
+    EFI_PHYSICAL_ADDRESS SourceAddress,
+    EFI_PHYSICAL_ADDRESS DestinationAddress,
+    UINTN Level
+)
+{
+    EFI_STATUS Status;
+    UINT64 *Source = (UINT64 *)(UINTN)SourceAddress;
+    UINT64 *Destination = (UINT64 *)(UINTN)DestinationAddress;
+
+    for (UINTN Index = 0; Index < PAGE_TABLE_ENTRY_COUNT; Index++) {
+        UINT64 Entry = Source[Index];
+        EFI_PHYSICAL_ADDRESS ChildAddress;
+        EFI_PHYSICAL_ADDRESS ClonedChildAddress;
+
+        Destination[Index] = Entry;
+        if ((Entry & PAGE_TABLE_ENTRY_PRESENT) == 0 || Level == 1) {
+            continue;
+        }
+
+        ChildAddress = Entry & PAGE_TABLE_ADDRESS_MASK;
+        if (ChildAddress == gOriginalPageTableRoot) {
+            ClonedChildAddress = gKernelPageTableRoot;
+        } else if ((Entry & PAGE_TABLE_ENTRY_HUGE) != 0) {
+            continue;
+        } else {
+            Status = gBS->AllocatePages(
+                EFI_ALLOCATE_ANY_PAGES,
+                EfiLoaderData,
+                1,
+                &ClonedChildAddress
+            );
+            if (EFI_ERROR(Status)) {
+                return Status;
+            }
+
+            Status = ClonePageTableLevel(
+                ChildAddress,
+                ClonedChildAddress,
+                Level - 1
+            );
+            if (EFI_ERROR(Status)) {
+                return Status;
+            }
+        }
+
+        Destination[Index] =
+            (Entry & ~PAGE_TABLE_ADDRESS_MASK) |
+            (ClonedChildAddress & PAGE_TABLE_ADDRESS_MASK);
+    }
+
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS AllocateZeroedPage(EFI_PHYSICAL_ADDRESS *Address)
+{
+    EFI_STATUS Status = gBS->AllocatePages(
+        EFI_ALLOCATE_ANY_PAGES,
+        EfiLoaderData,
+        1,
+        Address
+    );
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    ZeroMemory((volatile VOID *)(UINTN)*Address, PAGE_TABLE_SIZE);
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EnsurePhysicalPageDirectory(UINT64 PhysicalAddress, UINT64 **Level2)
+{
+    EFI_STATUS Status;
+    UINT64 *Level4 = (UINT64 *)(UINTN)gKernelPageTableRoot;
+    UINT64 *Level3;
+    EFI_PHYSICAL_ADDRESS NewPage;
+    UINTN Level3Index = (UINTN)((PhysicalAddress >> 30) & 0x1FF);
+
+    if ((Level4[gPhysicalMemoryPml4Index] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+        Status = AllocateZeroedPage(&NewPage);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        Level4[gPhysicalMemoryPml4Index] =
+            (NewPage & PAGE_TABLE_ADDRESS_MASK) |
+            PAGE_TABLE_ENTRY_PRESENT |
+            PAGE_TABLE_ENTRY_WRITABLE;
+    }
+
+    Level3 = (UINT64 *)(UINTN)(
+        Level4[gPhysicalMemoryPml4Index] & PAGE_TABLE_ADDRESS_MASK
+    );
+    if ((Level3[Level3Index] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+        Status = AllocateZeroedPage(&NewPage);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        Level3[Level3Index] =
+            (NewPage & PAGE_TABLE_ADDRESS_MASK) |
+            PAGE_TABLE_ENTRY_PRESENT |
+            PAGE_TABLE_ENTRY_WRITABLE;
+    }
+    if ((Level3[Level3Index] & PAGE_TABLE_ENTRY_HUGE) != 0) {
+        return EFI_ACCESS_DENIED;
+    }
+
+    *Level2 = (UINT64 *)(UINTN)(Level3[Level3Index] & PAGE_TABLE_ADDRESS_MASK);
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS EnsurePhysicalPageTable(UINT64 PhysicalAddress, UINT64 **PageTable)
+{
+    EFI_STATUS Status;
+    UINT64 *Level2;
+    EFI_PHYSICAL_ADDRESS NewPage;
+    UINTN Level2Index = (UINTN)((PhysicalAddress >> 21) & 0x1FF);
+
+    Status = EnsurePhysicalPageDirectory(PhysicalAddress, &Level2);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    if ((Level2[Level2Index] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+        Status = AllocateZeroedPage(&NewPage);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        Level2[Level2Index] =
+            (NewPage & PAGE_TABLE_ADDRESS_MASK) |
+            PAGE_TABLE_ENTRY_PRESENT |
+            PAGE_TABLE_ENTRY_WRITABLE;
+    }
+    if ((Level2[Level2Index] & PAGE_TABLE_ENTRY_HUGE) != 0) {
+        return EFI_ACCESS_DENIED;
+    }
+
+    *PageTable = (UINT64 *)(UINTN)(Level2[Level2Index] & PAGE_TABLE_ADDRESS_MASK);
+    return EFI_SUCCESS;
+}
+
+static BOOLEAN IsDirectMappedRamType(UINT32 Type)
+{
+    switch (Type) {
+        case EFI_LOADER_CODE_TYPE:
+        case EFI_LOADER_DATA_TYPE:
+        case EFI_BOOT_SERVICES_CODE_TYPE:
+        case EFI_BOOT_SERVICES_DATA_TYPE:
+        case EFI_RUNTIME_SERVICES_CODE_TYPE:
+        case EFI_RUNTIME_SERVICES_DATA_TYPE:
+        case EFI_CONVENTIONAL_MEMORY_TYPE:
+        case EFI_ACPI_RECLAIM_MEMORY_TYPE:
+        case EFI_ACPI_NVS_TYPE:
+        case EFI_PAL_CODE_TYPE:
+        case EFI_PERSISTENT_MEMORY_TYPE:
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
+static EFI_STATUS MapPhysicalPage4KiB(UINT64 PhysicalAddress)
+{
+    EFI_STATUS Status;
+    UINT64 *PageTable;
+    UINTN PageIndex = (UINTN)((PhysicalAddress >> 12) & 0x1FF);
+
+    Status = EnsurePhysicalPageTable(PhysicalAddress, &PageTable);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    if ((PageTable[PageIndex] & PAGE_TABLE_ENTRY_PRESENT) != 0) {
+        return EFI_ACCESS_DENIED;
+    }
+
+    PageTable[PageIndex] =
+        (PhysicalAddress & PAGE_TABLE_ADDRESS_MASK) |
+        PAGE_TABLE_ENTRY_PRESENT |
+        PAGE_TABLE_ENTRY_WRITABLE |
+        PAGE_TABLE_ENTRY_NO_EXECUTE;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS MapPhysicalPage2MiB(UINT64 PhysicalAddress)
+{
+    EFI_STATUS Status;
+    UINT64 *Level2;
+    UINTN Level2Index = (UINTN)((PhysicalAddress >> 21) & 0x1FF);
+
+    Status = EnsurePhysicalPageDirectory(PhysicalAddress, &Level2);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    if ((Level2[Level2Index] & PAGE_TABLE_ENTRY_PRESENT) != 0) {
+        if ((Level2[Level2Index] & PAGE_TABLE_ENTRY_HUGE) != 0) {
+            return EFI_ACCESS_DENIED;
+        }
+
+        for (UINTN Index = 0; Index < PAGE_TABLE_ENTRY_COUNT; Index++) {
+            UINT64 PhysicalPage = PhysicalAddress + Index * EFI_PAGE_SIZE;
+            UINT64 *PageTable;
+            Status = EnsurePhysicalPageTable(PhysicalPage, &PageTable);
+            if (EFI_ERROR(Status)) {
+                return Status;
+            }
+            UINTN PageIndex = (UINTN)((PhysicalPage >> 12) & 0x1FF);
+            if ((PageTable[PageIndex] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+                PageTable[PageIndex] =
+                    (PhysicalPage & PAGE_TABLE_ADDRESS_MASK) |
+                    PAGE_TABLE_ENTRY_PRESENT |
+                    PAGE_TABLE_ENTRY_WRITABLE |
+                    PAGE_TABLE_ENTRY_NO_EXECUTE;
+            }
+        }
+        return EFI_SUCCESS;
+    }
+
+    Level2[Level2Index] =
+        (PhysicalAddress & PAGE_TABLE_ADDRESS_MASK) |
+        PAGE_TABLE_ENTRY_PRESENT |
+        PAGE_TABLE_ENTRY_WRITABLE |
+        PAGE_TABLE_ENTRY_HUGE |
+        PAGE_TABLE_ENTRY_NO_EXECUTE;
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS MapPhysicalMemoryRange(UINT64 Start, UINT64 PageCount)
+{
+    UINT64 Size;
+    UINT64 End;
+    UINT64 Address;
+
+    if (PageCount > (~0ULL / EFI_PAGE_SIZE)) {
+        return EFI_INVALID_PARAMETER;
+    }
+    Size = PageCount * EFI_PAGE_SIZE;
+    if (Start > (~0ULL - Size)) {
+        return EFI_INVALID_PARAMETER;
+    }
+    End = Start + Size;
+    if (End > PHYSICAL_MAP_WINDOW_SIZE) {
+        return EFI_UNSUPPORTED;
+    }
+
+    Address = Start;
+    while (Address < End) {
+        EFI_STATUS Status;
+        if ((Address & (HUGE_PAGE_SIZE - 1)) == 0
+            && End - Address >= HUGE_PAGE_SIZE) {
+            Status = MapPhysicalPage2MiB(Address);
+            if (EFI_ERROR(Status)) {
+                return Status;
+            }
+            Address += HUGE_PAGE_SIZE;
+        } else {
+            Status = MapPhysicalPage4KiB(Address);
+            if (EFI_ERROR(Status)) {
+                return Status;
+            }
+            Address += EFI_PAGE_SIZE;
+        }
+    }
+
+    return EFI_SUCCESS;
+}
+
+static EFI_STATUS BuildPhysicalMemoryMapping(void)
+{
+    EFI_STATUS Status;
+    UINTN MapSize = 0;
+    UINTN MapKey = 0;
+    UINTN DescriptorSize = 0;
+    UINT32 DescriptorVersion = 0;
+    EFI_MEMORY_DESCRIPTOR *Map = NULL;
+    UINT64 *Level4 = (UINT64 *)(UINTN)gKernelPageTableRoot;
+    UINTN DescriptorCount;
+
+    for (gPhysicalMemoryPml4Index = 256;
+         gPhysicalMemoryPml4Index < PAGE_TABLE_ENTRY_COUNT;
+         gPhysicalMemoryPml4Index++) {
+        if ((Level4[gPhysicalMemoryPml4Index] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+            break;
+        }
+    }
+    if (gPhysicalMemoryPml4Index == PAGE_TABLE_ENTRY_COUNT) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    gPhysicalMemoryOffset =
+        0xFFFF000000000000ULL | ((UINT64)gPhysicalMemoryPml4Index << 39);
+
+    Status = gBS->GetMemoryMap(
+        &MapSize,
+        NULL,
+        &MapKey,
+        &DescriptorSize,
+        &DescriptorVersion
+    );
+    if (Status != EFI_BUFFER_TOO_SMALL || DescriptorSize == 0) {
+        return EFI_LOAD_ERROR;
+    }
+
+    MapSize += DescriptorSize * 32;
+    for (UINTN Attempt = 0; Attempt < 8; Attempt++) {
+        Status = gBS->AllocatePool(EfiLoaderData, MapSize, (VOID **)&Map);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+
+        UINTN CurrentSize = MapSize;
+        Status = gBS->GetMemoryMap(
+            &CurrentSize,
+            Map,
+            &MapKey,
+            &DescriptorSize,
+            &DescriptorVersion
+        );
+        if (Status == EFI_BUFFER_TOO_SMALL) {
+            gBS->FreePool(Map);
+            Map = NULL;
+            MapSize = CurrentSize + DescriptorSize * 32;
+            continue;
+        }
+        if (EFI_ERROR(Status)) {
+            gBS->FreePool(Map);
+            return Status;
+        }
+
+        DescriptorCount = CurrentSize / DescriptorSize;
+        for (UINTN Index = 0; Index < DescriptorCount; Index++) {
+            EFI_MEMORY_DESCRIPTOR *Descriptor =
+                (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)Map + Index * DescriptorSize);
+            if (!IsDirectMappedRamType(Descriptor->Type)) {
+                continue;
+            }
+
+            Status = MapPhysicalMemoryRange(
+                Descriptor->PhysicalStart,
+                Descriptor->NumberOfPages
+            );
+            if (EFI_ERROR(Status)) {
+                gBS->FreePool(Map);
+                return Status;
+            }
+        }
+
+        gBS->FreePool(Map);
+        return EFI_SUCCESS;
+    }
+
+    return EFI_OUT_OF_RESOURCES;
+}
+
+static EFI_STATUS CloneActivePageTables(EFI_PHYSICAL_ADDRESS *NewRoot)
+{
+    EFI_STATUS Status;
+    UINT64 Cr3Value;
+    UINT64 Cr4Value;
+
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+    __asm__ volatile("mov %%cr3, %0" : "=r"(Cr3Value));
+    __asm__ volatile("mov %%cr4, %0" : "=r"(Cr4Value));
+#else
+    return EFI_UNSUPPORTED;
+#endif
+
+    /* This kernel and its page-table library currently use four-level paging. */
+    if ((Cr4Value & (1ULL << 12)) != 0) {
+        return EFI_UNSUPPORTED;
+    }
+
+    gOriginalPageTableRoot = Cr3Value & PAGE_TABLE_ADDRESS_MASK;
+    Status = gBS->AllocatePages(
+        EFI_ALLOCATE_ANY_PAGES,
+        EfiLoaderData,
+        1,
+        &gKernelPageTableRoot
+    );
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    Status = ClonePageTableLevel(
+        gOriginalPageTableRoot,
+        gKernelPageTableRoot,
+        4
+    );
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    Status = BuildPhysicalMemoryMapping();
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    *NewRoot = gKernelPageTableRoot;
+    return EFI_SUCCESS;
 }
 
 static UINTN AsciiToUcs2(const char *Ascii, CHAR16 *Ucs2, UINTN Max)
@@ -830,7 +1258,7 @@ EFI_STATUS EFIAPI efi_main(
         EFI_TEXT_ATTR(EFI_GREEN, EFI_BLACK)
     );
 
-    PrintAscii("Rust UEFI bootloader\r\n");
+    PrintAscii("LeafOS UEFI boot [ok]\r\n");
     PrintAscii("Kernel target address: 0x200000\r\n\r\n");
 
     /*
@@ -877,6 +1305,22 @@ EFI_STATUS EFIAPI efi_main(
      */
     GetFramebufferInfo(Info);
 
+    Status = CloneActivePageTables(&Info->PageTableRoot);
+    if (EFI_ERROR(Status)) {
+        PrintAscii("[FATAL] Failed to clone active page tables\r\n");
+        PrintAscii("Status=");
+        PrintHex64(Status);
+        PrintAscii("\r\n");
+        return Status;
+    }
+    Info->PhysicalMemoryOffset = gPhysicalMemoryOffset;
+    PrintAscii("[OK] Cloned active page tables to ");
+    PrintHex64(Info->PageTableRoot);
+    PrintAscii("\r\n");
+    PrintAscii("[OK] Direct-mapped RAM at ");
+    PrintHex64(Info->PhysicalMemoryOffset);
+    PrintAscii("\r\n");
+
     PrintAscii("[OK] BootInfo prepared\r\n");
     PrintAscii("[..] Exiting UEFI boot services\r\n");
 
@@ -911,12 +1355,13 @@ EFI_STATUS EFIAPI efi_main(
     typedef VOID (KERNEL_CALL_ABI *KernelEntry)(BootInfo *Info);
     KernelEntry Entry = (KernelEntry)(UINTN)KERNEL_BASE_ADDRESS;
 
-#if defined(__GNUC__) && defined(__x86_64__)
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
     /*
      * Start kernel with interrupts disabled and direction flag cleared.
      */
     __asm__ volatile("cli");
     __asm__ volatile("cld");
+    __asm__ volatile("mov %0, %%cr3" : : "r"(Info->PageTableRoot) : "memory");
 #endif
 
     Entry(Info);
@@ -928,7 +1373,7 @@ EFI_STATUS EFIAPI efi_main(
      * or recover safely. Just halt.
      */
     for (;;) {
-#if defined(__GNUC__) && defined(__x86_64__)
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
         __asm__ volatile("hlt");
 #endif
     }

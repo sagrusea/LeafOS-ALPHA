@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
+#![feature(alloc_error_handler)]
 #![test_runner(kernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
@@ -9,14 +10,32 @@ use kernel::boot_info::BootInfo;
 use kernel::framebuffer::{self, FramebufferInfo};
 use kernel::{gop_print, gop_println, serial_println};
 
-
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("LeafOS kernel entered, boot_info={:p}", boot_info);
 
-    let boot_info = unsafe { BootInfo::from_ptr(boot_info) };
-    let framebuffer = boot_info.and_then(|info| unsafe { FramebufferInfo::from_boot_info(info) });
+    let boot_info: &'static BootInfo = match unsafe { BootInfo::from_ptr(boot_info) } {
+        Some(info) => info,
+        None => {
+            serial_println!("[FATAL] Missing or invalid BootInfo");
+            kernel::hlt_loop();
+        }
+    };
+
+    if let Err(error) = unsafe { kernel::memory::initialize(boot_info) } {
+        serial_println!("[FATAL] Memory initialization failed: {:?}", error);
+        kernel::hlt_loop();
+    }
+    serial_println!("[OK] Physical memory manager initialized");
+
+    if let Err(error) = unsafe { kernel::heap::initialize() } {
+        serial_println!("[FATAL] Heap initialization failed: {:?}", error);
+        kernel::hlt_loop();
+    }
+    serial_println!("[OK] Kernel heap initialized");
+
+    let framebuffer = unsafe { FramebufferInfo::from_boot_info(boot_info) };
 
     match framebuffer {
         Some(fb_info) => {
@@ -27,11 +46,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 fb_info.buffer.addr()
             );
             framebuffer::init(fb_info);
-            gop_println!("LEAFOS ALPHA build 2A0");
+            gop_println!("LEAFOS ALPHA build 2A1");
             gop_println!("KERNEL BOOT OK");
         }
         None => {
-            serial_println!("[WARN] No usable framebuffer -- BootInfo missing/invalid or GOP unavailable");
+            serial_println!(
+                "[WARN] No usable framebuffer -- BootInfo missing/invalid or GOP unavailable"
+            );
         }
     }
 
@@ -54,6 +75,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     kernel::hlt_loop();
 }
 
+#[alloc_error_handler]
+fn allocation_error(layout: core::alloc::Layout) -> ! {
+    serial_println!("[FATAL] Heap allocation failed: {:?}", layout);
+    kernel::hlt_loop();
+}
 
 #[cfg(test)]
 #[unsafe(no_mangle)]

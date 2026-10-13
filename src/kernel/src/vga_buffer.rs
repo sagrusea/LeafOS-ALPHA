@@ -1,12 +1,14 @@
 use core::fmt;
-use spin::Mutex;
 use spin::lazy::Lazy;
+use spin::Mutex;
 
-pub static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| Mutex::new(Writer {
-    column_position: 0,
-    color_code: ColorCode::new(Color::Yellow, Color::Black),
-    buffer: unsafe { &mut *(0xb8000 as *mut Buffer) }, 
-}));
+pub static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
+    Mutex::new(Writer {
+        column_position: 0,
+        color_code: ColorCode::new(Color::Yellow, Color::Black),
+        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+    })
+});
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +54,7 @@ const BUFFER_WIDTH: usize = 80;
 
 #[repr(transparent)]
 struct Buffer {
-    chars: [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT]
+    chars: [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT],
 }
 
 pub struct Writer {
@@ -76,11 +78,14 @@ impl Writer {
                 let color_code = self.color_code;
 
                 unsafe {
-                    let ptr = &mut self.buffer.chars[row][col] as * mut ScreenChar;
-                    core::ptr::write_volatile(ptr, ScreenChar {
-                        ascii_character: byte,
-                        color_code,
-                    });
+                    let ptr = &mut self.buffer.chars[row][col] as *mut ScreenChar;
+                    core::ptr::write_volatile(
+                        ptr,
+                        ScreenChar {
+                            ascii_character: byte,
+                            color_code,
+                        },
+                    );
                 }
                 self.column_position += 1;
             }

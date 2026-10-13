@@ -36,7 +36,8 @@ impl Pic8259 {
 
     pub unsafe fn initialize(&mut self) {
         unsafe {
-            self.master_command.write(ICW1_INITIALIZE | ICW1_EXPECT_ICW4);
+            self.master_command
+                .write(ICW1_INITIALIZE | ICW1_EXPECT_ICW4);
             io_wait();
             self.slave_command.write(ICW1_INITIALIZE | ICW1_EXPECT_ICW4);
             io_wait();

@@ -1,13 +1,13 @@
-use spin::Mutex;
-use x86_64::structures::idt::{InterruptDescriptorTable,InterruptStackFrame, PageFaultErrorCode};
-use crate::drivers::Pic8259;
 use crate::drivers::keyboard;
+use crate::drivers::Pic8259;
+use crate::gdt;
 use crate::gop_print;
 use crate::gop_println;
-use crate::gdt;
 use crate::hlt_loop;
-use spin::Lazy;
 use spin;
+use spin::Lazy;
+use spin::Mutex;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 pub const PIC_1_OFFSET: u8 = 32;
 pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
@@ -29,13 +29,12 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     let mut idt = InterruptDescriptorTable::new();
     idt.breakpoint.set_handler_fn(breakpoint_handler);
     unsafe {
-        idt.double_fault.set_handler_fn(double_fault_handler)
+        idt.double_fault
+            .set_handler_fn(double_fault_handler)
             .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
     }
-    idt[InterruptIndex::Timer.as_u8()]
-        .set_handler_fn(timer_interrupt_handler);
-    idt[InterruptIndex::Keyboard.as_u8()]
-        .set_handler_fn(keyboard_interrupt_handler);
+    idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
+    idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt
 });
@@ -44,21 +43,18 @@ pub fn init_idt() {
     IDT.load();
 }
 
-extern "x86-interrupt" fn breakpoint_handler(
-    stack_frame: InterruptStackFrame)
-    {
-        gop_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
-    }
+extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    gop_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
+}
 
 extern "x86-interrupt" fn double_fault_handler(
-    stack_frame: InterruptStackFrame, _error_code: u64) -> !{
-        panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
-    }
+    stack_frame: InterruptStackFrame,
+    _error_code: u64,
+) -> ! {
+    panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+}
 
-
-extern "x86-interrupt" fn timer_interrupt_handler(
-    _stack_frame: InterruptStackFrame,
-) {
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     //gop_print!(".");
 
     unsafe {
@@ -80,11 +76,9 @@ extern "x86-interrupt" fn page_fault_handler(
     hlt_loop();
 }
 
-extern "x86-interrupt" fn keyboard_interrupt_handler(
-    _stack_frame: InterruptStackFrame)
-{
+extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    use crate::drivers::{KeyState, Keyboard};
     use x86_64::instructions::port::Port;
-    use crate::drivers::{Keyboard, KeyState};
 
     static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
 
@@ -115,8 +109,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(
     }
 }
 
-
-pub static PICS: spin::Mutex<Pic8259> = 
+pub static PICS: spin::Mutex<Pic8259> =
     spin::Mutex::new(unsafe { Pic8259::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 #[test_case]

@@ -11,19 +11,21 @@ pub struct BootInfo {
     pub magic: u64,
     pub version: u32,
     pub _padding0: u32,
- 
+
     pub system_table: *mut core::ffi::c_void,
- 
+
     pub memory_map: *mut core::ffi::c_void,
     pub memory_map_size: usize,
     pub descriptor_size: usize,
     pub descriptor_version: u32,
     pub _padding1: u32,
- 
+
     pub kernel_base: u64,
     pub kernel_file_size: u64,
     pub kernel_reserved_size: u64,
- 
+    pub page_table_root: u64,
+    pub physical_memory_offset: u64,
+
     pub framebuffer_base: u64,
     pub framebuffer_size: u64,
     pub framebuffer_width: u32,
@@ -33,6 +35,13 @@ pub struct BootInfo {
 }
 
 impl BootInfo {
+    /// Converts the bootloader's raw pointer to a reference.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be aligned, readable for a complete `BootInfo`, and remain
+    /// valid for the inferred lifetime. The bootloader must pass its live
+    /// handoff structure.
     pub unsafe fn from_ptr<'a>(ptr: *const BootInfo) -> Option<&'a BootInfo> {
         if ptr.is_null() {
             return None;

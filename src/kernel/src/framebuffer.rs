@@ -1,9 +1,8 @@
+use crate::boot_info::{self, BootInfo};
+use crate::misc::font::get_glyph;
 use core::fmt;
 use core::ptr::NonNull;
-use crate::boot_info::{self, BootInfo};
 use spin::{Mutex, Once};
-use crate::misc::font::get_glyph;
-
 
 #[derive(Debug, Clone, Copy)]
 pub struct FramebufferBuffer {
@@ -36,7 +35,6 @@ impl FramebufferBuffer {
         }
     }
 
-
     pub fn copy_within(&mut self, src_offset: usize, dst_offset: usize, count: usize) {
         if src_offset + count <= self.size && dst_offset + count <= self.size {
             unsafe {
@@ -61,8 +59,9 @@ pub struct FramebufferInfo {
 
 impl FramebufferInfo {
     pub unsafe fn from_boot_info(boot_info: &BootInfo) -> Option<Self> {
-        if boot_info.framebuffer_base == 0 
-            || boot_info.framebuffer_pixel_format == boot_info::PIXEL_FORMAT_BLT_ONLY {
+        if boot_info.framebuffer_base == 0
+            || boot_info.framebuffer_pixel_format == boot_info::PIXEL_FORMAT_BLT_ONLY
+        {
             return None;
         }
 
@@ -72,7 +71,8 @@ impl FramebufferInfo {
         let stride = boot_info.framebuffer_pixels_per_scan_line as usize * bytes_per_pixel;
         let size = stride * height;
 
-        let buffer = unsafe { FramebufferBuffer::new(boot_info.framebuffer_base as *mut u8, size)?};
+        let buffer =
+            unsafe { FramebufferBuffer::new(boot_info.framebuffer_base as *mut u8, size)? };
 
         Some(Self {
             buffer,
@@ -256,8 +256,7 @@ mod tests {
     const TEST_HEIGHT: usize = 480;
     const TEST_STRIDE: usize = TEST_WIDTH * 4;
 
-    static mut TEST_BUFFER: [u8; TEST_STRIDE * TEST_HEIGHT] =
-        [0; TEST_STRIDE * TEST_HEIGHT];
+    static mut TEST_BUFFER: [u8; TEST_STRIDE * TEST_HEIGHT] = [0; TEST_STRIDE * TEST_HEIGHT];
 
     fn init_test_framebuffer() {
         let buffer = unsafe {

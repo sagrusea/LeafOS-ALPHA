@@ -1,4 +1,3 @@
-
 #![no_std]
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,17 +118,11 @@ impl Keyboard {
             KeyCode::RightAlt => self.right_alt = !released,
             KeyCode::CapsLock if !released => self.caps_lock = !self.caps_lock,
             KeyCode::NumLock if !released => self.num_lock = !self.num_lock,
-            KeyCode::ScrollLock if !released => {
-                self.scroll_lock = !self.scroll_lock
-            }
+            KeyCode::ScrollLock if !released => self.scroll_lock = !self.scroll_lock,
             _ => {}
         }
 
-        let ascii = if released {
-            None
-        } else {
-            self.to_ascii(key)
-        };
+        let ascii = if released { None } else { self.to_ascii(key) };
 
         Some(KeyEvent {
             code: key,
