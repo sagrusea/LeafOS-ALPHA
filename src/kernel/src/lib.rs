@@ -11,11 +11,12 @@ use x86::io::outl;
 pub mod boot_info;
 pub mod drivers;
 pub mod framebuffer;
+pub mod fs;
 pub mod gdt;
-pub mod heap;
 pub mod interrupts;
 pub mod memory;
 pub mod serial;
+pub mod shell;
 pub mod vga_buffer;
 
 pub trait Testable {

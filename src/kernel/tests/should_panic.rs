@@ -5,8 +5,11 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
-use kernel::{QemuExitCode::{self, Success}, exit_qemu, serial_print, serial_println};
 use kernel::gop_print;
+use kernel::{
+    QemuExitCode::{self, Success},
+    exit_qemu, serial_print, serial_println,
+};
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
@@ -14,7 +17,7 @@ pub extern "C" fn _start() -> ! {
     should_fail();
     serial_println!("[test did not panic]");
     exit_qemu(QemuExitCode::Failed);
-    loop{}
+    loop {}
 }
 
 fn should_fail() {

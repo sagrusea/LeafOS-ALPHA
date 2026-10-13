@@ -1,8 +1,8 @@
 use spin::Lazy;
+use x86_64::VirtAddr;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 const STACK_SIZE: usize = 4096 * 5;
@@ -41,7 +41,7 @@ struct Selectors {
 }
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{Segment, CS, SS};
+    use x86_64::instructions::segmentation::{CS, SS, Segment};
     use x86_64::instructions::tables::load_tss;
 
     GDT.0.load();

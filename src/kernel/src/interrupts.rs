@@ -1,9 +1,8 @@
-use crate::drivers::keyboard;
 use crate::drivers::Pic8259;
 use crate::gdt;
-use crate::gop_print;
 use crate::gop_println;
 use crate::hlt_loop;
+use crate::shell;
 use spin;
 use spin::Lazy;
 use spin::Mutex;
@@ -90,15 +89,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     if let Some(event) = keyboard.process_scancode(scancode) {
         if event.state == KeyState::Pressed {
             if let Some(byte) = event.ascii {
-                match byte {
-                    b'\n' => gop_print!("\n"),
-                    0x08 => gop_print!("\x08"),
-                    0x1B => gop_print!("\x1B"),
-                    0x20..=0x7E => gop_print!("{}", byte as char),
-                    _ => {}
+                if byte == b'\n' || byte == 0x08 || byte == 0x03 || (0x20..=0x7e).contains(&byte) {
+                    shell::enqueue_key(byte);
                 }
-            } else {
-                gop_print!("{:?}", event.code);
             }
         }
     }

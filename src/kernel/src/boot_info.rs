@@ -32,6 +32,9 @@ pub struct BootInfo {
     pub framebuffer_height: u32,
     pub framebuffer_pixels_per_scan_line: u32,
     pub framebuffer_pixel_format: u32,
+
+    pub initrd_base: *const u8,
+    pub initrd_size: usize,
 }
 
 impl BootInfo {

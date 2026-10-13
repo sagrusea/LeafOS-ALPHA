@@ -1,6 +1,6 @@
-use spin::lazy::Lazy;
 use spin::Mutex;
-use uart_16550::{backend::PioBackend, Config, Uart16550Tty};
+use spin::lazy::Lazy;
+use uart_16550::{Config, Uart16550Tty, backend::PioBackend};
 
 pub static SERIAL1: Lazy<Mutex<Uart16550Tty<PioBackend>>> = Lazy::new(|| {
     Mutex::new(unsafe {

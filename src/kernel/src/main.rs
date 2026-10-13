@@ -8,7 +8,7 @@
 use core::panic::PanicInfo;
 use kernel::boot_info::BootInfo;
 use kernel::framebuffer::{self, FramebufferInfo};
-use kernel::{gop_print, gop_println, serial_println};
+use kernel::{gop_println, serial_println};
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
@@ -29,7 +29,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     serial_println!("[OK] Physical memory manager initialized");
 
-    if let Err(error) = unsafe { kernel::heap::initialize() } {
+    if let Err(error) = unsafe { kernel::fs::initialize(boot_info) } {
+        serial_println!("[FATAL] Initrd validation failed: {:?}", error);
+        kernel::hlt_loop();
+    }
+    serial_println!("[OK] Read-only initrd mounted");
+
+    if let Err(error) = unsafe { kernel::memory::heap::initialize() } {
         serial_println!("[FATAL] Heap initialization failed: {:?}", error);
         kernel::hlt_loop();
     }
@@ -46,7 +52,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 fb_info.buffer.addr()
             );
             framebuffer::init(fb_info);
-            gop_println!("LEAFOS ALPHA build 2A1");
+            gop_println!("LEAFOS ALPHA build 2A2");
             gop_println!("KERNEL BOOT OK");
         }
         None => {
@@ -58,9 +64,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     kernel::init();
 
-    gop_println!("NO CRASH!");
-
-    kernel::hlt_loop();
+    kernel::shell::run();
 }
 
 #[cfg(not(test))]
@@ -75,6 +79,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     kernel::hlt_loop();
 }
 
+#[cfg(not(test))]
 #[alloc_error_handler]
 fn allocation_error(layout: core::alloc::Layout) -> ! {
     serial_println!("[FATAL] Heap allocation failed: {:?}", layout);

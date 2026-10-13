@@ -126,6 +126,18 @@ impl FramebufferWriter {
         self.y = MARGIN;
     }
 
+    pub fn backspace(&mut self) {
+        if self.x == MARGIN {
+            return;
+        }
+        self.x -= CHAR_WIDTH;
+        for y in self.y..self.y + 8 {
+            for x in self.x..self.x + CHAR_WIDTH {
+                self.write_pixel(x, y, 0, 0, 0);
+            }
+        }
+    }
+
     fn clear_rows(&mut self, start_row: usize, count: usize) {
         let stride = self.info.stride;
         let offset = start_row * stride;
@@ -195,6 +207,7 @@ impl fmt::Write for FramebufferWriter {
         for byte in s.bytes() {
             match byte {
                 b'\n' => self.new_line(),
+                b'\r' => {}
                 byte => {
                     if self.x + CHAR_WIDTH + MARGIN >= self.info.width {
                         self.new_line();
@@ -217,6 +230,22 @@ pub fn init(info: FramebufferInfo) {
 
 pub fn is_initialized() -> bool {
     WRITER.get().is_some()
+}
+
+pub fn clear() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().clear();
+        }
+    });
+}
+
+pub fn backspace() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().backspace();
+        }
+    });
 }
 
 pub fn set_color(r: u8, g: u8, b: u8) {
@@ -347,6 +376,19 @@ mod tests {
                     }
                 }
             }
+        });
+    }
+
+    #[test_case]
+    fn test_gop_print_handles_crlf() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            gop_print!("first\r\nsecond");
+
+            let writer = WRITER.get().unwrap().lock();
+            assert_eq!(writer.x, MARGIN + "second".len() * CHAR_WIDTH);
+            assert_eq!(writer.y, MARGIN + LINE_HEIGHT);
         });
     }
 }

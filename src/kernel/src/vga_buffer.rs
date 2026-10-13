@@ -1,6 +1,6 @@
 use core::fmt;
-use spin::lazy::Lazy;
 use spin::Mutex;
+use spin::lazy::Lazy;
 
 pub static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
     Mutex::new(Writer {

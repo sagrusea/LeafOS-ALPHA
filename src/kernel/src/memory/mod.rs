@@ -1,24 +1,26 @@
 use spin::{Mutex, Once};
 use x86_64::{
+    PhysAddr, VirtAddr,
     registers::control::Cr3,
     structures::paging::{
+        FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
+        PhysFrame, Size4KiB, Translate,
         mapper::CleanUp,
         mapper::{MapToError, UnmapError},
         page::PageRangeInclusive,
-        FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
-        PhysFrame, Size4KiB, Translate,
     },
-    PhysAddr, VirtAddr,
 };
 
 use crate::boot_info::BootInfo;
+
+pub mod heap;
 
 const EFI_CONVENTIONAL_MEMORY: u32 = 7;
 const PAGE_SIZE: u64 = 4096;
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
 const EFI_DESCRIPTOR_MIN_SIZE: usize = 40;
 const RECLAIMED_FRAME_CAPACITY: usize = 260;
-const EFI_MEMORY_MAP_VERSION: u32 = 1;
+const EFI_MEMORY_MAP_VERSION: u32 = 2;
 const EFI_MEMORY_DESCRIPTOR_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -3,7 +3,7 @@
 #![feature(abi_x86_interrupt)]
 
 use core::panic::PanicInfo;
-use kernel::{exit_qemu, QemuExitCode, serial_println, serial_print};
+use kernel::{QemuExitCode, exit_qemu, serial_print, serial_println};
 use spin::Lazy;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
 
@@ -29,7 +29,7 @@ fn panic(info: &PanicInfo) -> ! {
 fn stack_overflow() {
     let dummy = [0u8; 1024];
     core::hint::black_box(&dummy);
-    
+
     stack_overflow();
 }
 
@@ -42,7 +42,6 @@ static TEST_IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt
 });
-
 
 extern "x86-interrupt" fn test_double_fault_handler(
     _stack_frame: InterruptStackFrame,

@@ -12,9 +12,9 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 use kernel::boot_info::BootInfo;
 use kernel::serial_println;
 use x86_64::{
+    VirtAddr,
     registers::control::Cr3,
     structures::paging::{Page, PageTableFlags},
-    VirtAddr,
 };
 
 static BOOT_INFO: AtomicPtr<BootInfo> = AtomicPtr::new(core::ptr::null_mut());
@@ -25,7 +25,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     BOOT_INFO.store(boot_info.cast_mut(), Ordering::Relaxed);
     if let Some(boot_info) = unsafe { BootInfo::from_ptr(boot_info) } {
         unsafe { kernel::memory::initialize(boot_info) }.expect("initialize memory manager");
-        unsafe { kernel::heap::initialize() }.expect("initialize kernel heap");
+        unsafe { kernel::fs::initialize(boot_info) }.expect("validate initrd");
+        unsafe { kernel::memory::heap::initialize() }.expect("initialize kernel heap");
     }
     test_main();
 
@@ -141,15 +142,63 @@ fn test_failed_mapping_reclaims_allocated_frame() {
 
 #[test_case]
 fn test_kernel_heap_allocates_and_reuses_memory() {
-    let mut first = Vec::with_capacity(4096);
-    for value in 0..4096 {
+    let mut first = Vec::with_capacity(300_000);
+    for value in 0..300_000 {
         first.push(value);
     }
-    assert_eq!(first[2048], 2048);
+    assert_eq!(first[150_000], 150_000);
     drop(first);
 
-    let second = Vec::<u64>::with_capacity(4096);
-    assert!(second.capacity() >= 4096);
+    let second = Vec::<u64>::with_capacity(300_000);
+    assert!(second.capacity() >= 300_000);
+}
+
+#[test_case]
+fn test_initrd_lists_and_reads_files() {
+    let mut found_readme = false;
+    kernel::fs::for_each_file(|name, _| {
+        found_readme |= name == "README.TXT";
+    })
+    .expect("list initrd files");
+    assert!(found_readme);
+
+    let contents = kernel::fs::read_file("README.TXT")
+        .expect("read initrd file")
+        .expect("README.TXT exists");
+    assert!(
+        core::str::from_utf8(contents)
+            .expect("README is UTF-8")
+            .contains("LeafOS")
+    );
+    assert!(
+        kernel::fs::read_file("../README.TXT")
+            .expect("reject unsafe path")
+            .is_none()
+    );
+
+    assert!(kernel::fs::directory_exists("docs").expect("check nested directory"));
+    let mut found_docs = false;
+    kernel::fs::for_each_entry("", |name, is_dir, _| {
+        found_docs |= name == "docs" && is_dir;
+    })
+    .expect("list root directory");
+    assert!(found_docs);
+
+    let mut found_about = false;
+    kernel::fs::for_each_entry("docs", |name, is_dir, _| {
+        found_about |= name == "ABOUT.TXT" && !is_dir;
+    })
+    .expect("list nested directory");
+    assert!(found_about);
+    let nested_contents = kernel::fs::read_file("docs/ABOUT.TXT")
+        .expect("read nested initrd file")
+        .expect("nested file exists");
+    assert!(
+        core::str::from_utf8(nested_contents)
+            .expect("nested file is UTF-8")
+            .contains("directories")
+    );
+    assert!(!kernel::fs::directory_exists("../docs").expect("reject traversal path"));
 }
 
 #[alloc_error_handler]

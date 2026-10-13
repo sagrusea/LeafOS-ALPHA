@@ -202,6 +202,7 @@ struct _EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
 /* ========================================================================== */
 
 #define BOOT_INFO_MAGIC 0x52555354424F4F54ULL
+#define INITRD_MAX_SIZE (16ULL * 1024ULL * 1024ULL)
 
 typedef struct {
     UINT64 Magic;
@@ -229,6 +230,9 @@ typedef struct {
     UINT32 FramebufferHeight;
     UINT32 FramebufferPixelsPerScanLine;
     UINT32 FramebufferPixelFormat;   /* EFI_GRAPHICS_PIXEL_FORMAT */
+
+    VOID *InitrdBase;
+    UINTN InitrdSize;
 } BootInfo;
 
 /* ========================================================================== */
@@ -1119,6 +1123,81 @@ Cleanup:
     return Status;
 }
 
+static EFI_STATUS LoadInitrd(BootInfo *Info)
+{
+    EFI_STATUS Status;
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *FileSystem = NULL;
+    EFI_FILE_PROTOCOL *Root = NULL;
+    EFI_FILE_PROTOCOL *File = NULL;
+    EFI_FILE_INFO *FileInfo = NULL;
+    EFI_GUID FileInfoGuid = EFI_FILE_INFO_GUID;
+    static const CHAR16 Path[] = {
+        '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\',
+        'i', 'n', 'i', 't', 'r', 'd', '.', 't', 'a', 'r', 0
+    };
+    UINTN FileInfoSize = 0;
+    UINTN ReadSize;
+
+    Status = FindBootFileSystem(&FileSystem);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    Status = FileSystem->OpenVolume(FileSystem, &Root);
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+    Status = Root->Open(Root, &File, Path, EFI_FILE_MODE_READ, 0);
+    if (EFI_ERROR(Status)) {
+        goto Cleanup;
+    }
+    Status = File->GetInfo(File, &FileInfoGuid, &FileInfoSize, NULL);
+    if (Status != EFI_BUFFER_TOO_SMALL) {
+        Status = EFI_LOAD_ERROR;
+        goto Cleanup;
+    }
+    Status = gBS->AllocatePool(EfiBootServicesData, FileInfoSize, (VOID **)&FileInfo);
+    if (EFI_ERROR(Status)) {
+        goto Cleanup;
+    }
+    Status = File->GetInfo(File, &FileInfoGuid, &FileInfoSize, FileInfo);
+    if (EFI_ERROR(Status)) {
+        goto Cleanup;
+    }
+    if (FileInfo->FileSize == 0 || FileInfo->FileSize > INITRD_MAX_SIZE) {
+        Status = EFI_BAD_BUFFER_SIZE;
+        goto Cleanup;
+    }
+
+    Info->InitrdSize = (UINTN)FileInfo->FileSize;
+    Status = gBS->AllocatePool(EfiLoaderData, Info->InitrdSize, &Info->InitrdBase);
+    if (EFI_ERROR(Status)) {
+        Info->InitrdSize = 0;
+        goto Cleanup;
+    }
+    ReadSize = Info->InitrdSize;
+    Status = File->Read(File, &ReadSize, Info->InitrdBase);
+    if (EFI_ERROR(Status) || ReadSize != Info->InitrdSize) {
+        gBS->FreePool(Info->InitrdBase);
+        Info->InitrdBase = NULL;
+        Info->InitrdSize = 0;
+        Status = EFI_LOAD_ERROR;
+        goto Cleanup;
+    }
+    Status = EFI_SUCCESS;
+
+Cleanup:
+    if (FileInfo) {
+        gBS->FreePool(FileInfo);
+    }
+    if (File) {
+        File->Close(File);
+    }
+    if (Root) {
+        Root->Close(Root);
+    }
+    return Status;
+}
+
 /* ========================================================================== */
 /*                        FINAL MEMORY MAP / EXIT BS                          */
 /* ========================================================================== */
@@ -1293,11 +1372,21 @@ EFI_STATUS EFIAPI efi_main(
     ZeroMemory((volatile VOID *)Info, sizeof(*Info));
 
     Info->Magic = BOOT_INFO_MAGIC;
-    Info->Version = 1;
+    Info->Version = 2;
     Info->SystemTable = SystemTable;
     Info->KernelBase = KERNEL_BASE_ADDRESS;
     Info->KernelFileSize = KernelFileSize;
     Info->KernelReservedSize = (UINT64)KERNEL_RESERVE_PAGES * EFI_PAGE_SIZE;
+
+    Status = LoadInitrd(Info);
+    if (EFI_ERROR(Status)) {
+        PrintAscii("[FATAL] Failed to load initrd.tar\r\n");
+        PrintAscii("Status=");
+        PrintHex64(Status);
+        PrintAscii("\r\n");
+        return Status;
+    }
+    PrintAscii("[OK] Loaded read-only initrd\r\n");
 
     /*
      * Query the framebuffer while Boot Services (LocateProtocol) are
