@@ -8,8 +8,10 @@
 use core::panic::PanicInfo;
 extern crate alloc;
 use alloc::vec::Vec;
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicPtr, Ordering};
 use kernel::boot_info::BootInfo;
+use kernel::scheduler::{self, TaskId, TaskState};
 use kernel::serial_println;
 use x86_64::{
     VirtAddr,
@@ -18,6 +20,26 @@ use x86_64::{
 };
 
 static BOOT_INFO: AtomicPtr<BootInfo> = AtomicPtr::new(core::ptr::null_mut());
+static SCHEDULER_EVENT_INDEX: AtomicUsize = AtomicUsize::new(0);
+static SCHEDULER_EVENTS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+
+fn record_scheduler_event(value: usize) {
+    let index = SCHEDULER_EVENT_INDEX.fetch_add(1, Ordering::SeqCst);
+    assert!(index < SCHEDULER_EVENTS.len());
+    SCHEDULER_EVENTS[index].store(value, Ordering::SeqCst);
+}
+
+fn first_kernel_task() {
+    record_scheduler_event(1);
+    scheduler::yield_now().expect("first task should yield");
+    record_scheduler_event(3);
+}
+
+fn second_kernel_task() {
+    record_scheduler_event(2);
+    scheduler::yield_now().expect("second task should yield");
+    record_scheduler_event(4);
+}
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
@@ -32,6 +54,33 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     test_main();
 
     loop {}
+}
+
+#[test_case]
+fn test_cooperative_tasks_yield_terminate_and_return_to_bootstrap() {
+    SCHEDULER_EVENT_INDEX.store(0, Ordering::SeqCst);
+    for event in &SCHEDULER_EVENTS {
+        event.store(0, Ordering::SeqCst);
+    }
+
+    let first: TaskId = scheduler::spawn(first_kernel_task).expect("spawn first task");
+    let second: TaskId = scheduler::spawn(second_kernel_task).expect("spawn second task");
+    scheduler::run_tasks().expect("run cooperative tasks");
+
+    assert_eq!(SCHEDULER_EVENT_INDEX.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        [
+            SCHEDULER_EVENTS[0].load(Ordering::SeqCst),
+            SCHEDULER_EVENTS[1].load(Ordering::SeqCst),
+            SCHEDULER_EVENTS[2].load(Ordering::SeqCst),
+            SCHEDULER_EVENTS[3].load(Ordering::SeqCst),
+        ],
+        [1, 2, 3, 4]
+    );
+    assert_eq!(scheduler::task_state(first), Ok(TaskState::Terminated));
+    assert_eq!(scheduler::task_state(second), Ok(TaskState::Terminated));
+    scheduler::reap_terminated(first).expect("reap first task");
+    scheduler::reap_terminated(second).expect("reap second task");
 }
 
 #[panic_handler]
@@ -346,7 +395,47 @@ fn test_ext2_creates_and_removes_root_entries_safely() {
 
     ext2::create_directory("PARENT").expect("create parent directory");
     ext2::create_directory("PARENT/CHILD").expect("create nested directory");
+    assert!(ext2::directory_exists("docs").expect("root directory remains accessible"));
+    let mut found_parent = false;
+    ext2::for_each_entry("", |name, is_dir, _| {
+        if name == "PARENT" && is_dir {
+            found_parent = true;
+        }
+    })
+    .expect("list ext2 root after nested directory creation");
+    assert!(
+        found_parent,
+        "ext2 root listing should retain the parent directory"
+    );
     assert!(ext2::directory_exists("PARENT/CHILD").expect("check nested directory"));
+    assert!(ext2::directory_exists("PARENT").expect("check nested parent directory"));
+    let mut found_child = false;
+    ext2::for_each_entry("PARENT", |name, is_dir, _| {
+        if name == "CHILD" && is_dir {
+            found_child = true;
+        }
+    })
+    .expect("list nested parent directory");
+    assert!(
+        found_child,
+        "nested parent listing should include its child"
+    );
+    ext2::write_file("PARENT/CHILD/EDIT.TXT", b"nested editor save")
+        .expect("create file for nested editor path");
+    let mut nested_contents = [0; 32];
+    let (copied, total) = ext2::read_file("PARENT/CHILD/EDIT.TXT", &mut nested_contents)
+        .expect("read nested editor path")
+        .expect("nested file exists");
+    assert_eq!(total, b"nested editor save".len() as u64);
+    assert_eq!(&nested_contents[..copied], b"nested editor save");
+    ext2::write_file("PARENT/CHILD/EDIT.TXT", b"saved again")
+        .expect("save changes to existing nested file");
+    let (copied, total) = ext2::read_file("PARENT/CHILD/EDIT.TXT", &mut nested_contents)
+        .expect("read updated nested editor path")
+        .expect("updated nested file exists");
+    assert_eq!(total, b"saved again".len() as u64);
+    assert_eq!(&nested_contents[..copied], b"saved again");
+    ext2::remove_file("PARENT/CHILD/EDIT.TXT").expect("remove nested test file");
     assert_eq!(
         ext2::remove_empty_directory("PARENT"),
         Err(Ext2Error::NotEmpty)

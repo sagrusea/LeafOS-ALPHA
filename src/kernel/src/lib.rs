@@ -10,17 +10,21 @@ extern crate alloc;
 use core::panic::PanicInfo;
 use x86::io::{outl, outw};
 
+pub mod arch;
 pub mod boot_info;
+pub mod console;
 pub mod drivers;
-pub mod framebuffer;
 pub mod fs;
-pub mod gdt;
-pub mod interrupts;
 pub mod memory;
-pub mod serial;
+pub mod misc;
 pub mod shell;
-pub mod timer;
-pub mod vga_buffer;
+pub mod tasking;
+pub mod time;
+
+pub use arch::{gdt, interrupts};
+pub use console::{framebuffer, serial, vga_buffer};
+pub use tasking::scheduler;
+pub use time::timer;
 
 pub trait Testable {
     fn run(&self) -> ();
@@ -100,8 +104,4 @@ pub fn hlt_loop() -> ! {
     loop {
         x86_64::instructions::hlt();
     }
-}
-
-pub mod misc {
-    pub mod font;
 }

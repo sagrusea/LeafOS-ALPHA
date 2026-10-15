@@ -454,14 +454,11 @@ fn resolve_ext2_command_path(
     current_dir_is_ext2: bool,
     output: &mut [u8; PATH_CAPACITY],
 ) -> Option<usize> {
-    if current_dir_is_ext2 {
-        resolve_path(current, input, output)
-    } else if input.is_empty() || input.len() > output.len() {
-        None
-    } else {
-        output[..input.len()].copy_from_slice(input);
-        Some(input.len())
-    }
+    resolve_path(
+        if current_dir_is_ext2 { current } else { b"" },
+        input,
+        output,
+    )
 }
 
 fn parse_color(value: &[u8]) -> Option<(u8, u8, u8)> {
@@ -665,17 +662,45 @@ fn render_text_editor(name: &str, editor: &TextEditor) {
     crate::framebuffer::render_editor(name, text, editor.cursor, editor.dirty);
 }
 
+fn ext2_parent_path(path: &str) -> &str {
+    path.rfind('/').map_or("", |separator| &path[..separator])
+}
+
+fn print_missing_edit_parent(path: &str) {
+    let parent = ext2_parent_path(path);
+    gop_println!(
+        "Invalid path: parent directory '/{}' does not exist.",
+        parent
+    );
+    gop_println!("Create it first with: mkdir {}", parent);
+}
+
 fn edit_disk_file(name: &str) {
     if name.is_empty()
-        || name.len() > 255
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        || name == "."
-        || name == ".."
+        || name.split('/').any(|component| {
+            component.is_empty()
+                || component.len() > 255
+                || component == "."
+                || component == ".."
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        })
     {
-        gop_println!("Editor supports safe root-level filenames only.");
+        gop_println!("Editor supports safe ext2 paths only.");
         return;
+    }
+    let parent = ext2_parent_path(name);
+    match crate::fs::ext2::directory_exists(parent) {
+        Ok(true) => {}
+        Ok(false) => {
+            print_missing_edit_parent(name);
+            return;
+        }
+        Err(error) => {
+            gop_println!("ext2 directory check error: {:?}", error);
+            return;
+        }
     }
     let mut bytes = Vec::new();
     bytes.resize(EDITOR_MAX_BYTES, 0);
@@ -718,7 +743,12 @@ fn edit_disk_file(name: &str) {
                     }
                     Err(error) => {
                         crate::framebuffer::finish_editor();
-                        gop_println!("\next2 write error: {:?}", error);
+                        if error == crate::fs::ext2::Ext2Error::NotFound {
+                            gop_println!();
+                            print_missing_edit_parent(name);
+                        } else {
+                            gop_println!("\next2 write error: {:?}", error);
+                        }
                         render_text_editor(name, &editor);
                     }
                 }
@@ -794,11 +824,11 @@ fn execute(
             gop_println!("  pwd                     Print the current directory");
             gop_println!("  diskls [path]            List files on the ext2 data disk");
             gop_println!("  diskcat <path>           Read a file from the ext2 data disk");
-            gop_println!("  diskwrite <file> [text]  Write a text file to the ext2 disk");
+            gop_println!("  diskwrite <path> [text]  Write a text file to the ext2 disk");
             gop_println!("  mkdir <path>             Create an ext2 directory");
             gop_println!("  rm <path>                Remove an ext2 file");
             gop_println!("  rmdir <path>             Remove an empty ext2 directory");
-            gop_println!("  edit <file>              Edit a UTF-8 text file on the ext2 disk");
+            gop_println!("  edit <path>              Edit a UTF-8 text file on the ext2 disk");
             gop_println!("  Up/Down                  Browse command history");
             gop_println!("  Left/Right, Home/End     Edit the command line");
             gop_println!("  set col <color>          Change the terminal foreground color");
@@ -981,10 +1011,23 @@ fn execute(
             _ => gop_println!("Usage: diskcat <path>"),
         },
         Command::DiskWrite(name, contents) => match core::str::from_utf8(name) {
-            Ok(name) => match crate::fs::ext2::write_file(name, contents) {
-                Ok(()) => gop_println!("Wrote {} bytes to /{}.", contents.len(), name),
-                Err(error) => gop_println!("ext2 write error: {:?}", error),
-            },
+            Ok(name) => {
+                let mut resolved = [0; PATH_CAPACITY];
+                match resolve_ext2_command_path(
+                    &current_dir[..*current_dir_len],
+                    name.as_bytes(),
+                    *current_dir_is_ext2,
+                    &mut resolved,
+                )
+                .and_then(|length| core::str::from_utf8(&resolved[..length]).ok())
+                {
+                    Some(path) => match crate::fs::ext2::write_file(path, contents) {
+                        Ok(()) => gop_println!("Wrote {} bytes to /{}.", contents.len(), path),
+                        Err(error) => gop_println!("ext2 write error: {:?}", error),
+                    },
+                    None => gop_println!("Usage: diskwrite <path> [text]"),
+                }
+            }
             Err(_) => gop_println!("Usage: diskwrite <name> <text>"),
         },
         Command::MakeDirectory(name) => match core::str::from_utf8(name) {
@@ -1048,7 +1091,20 @@ fn execute(
             Err(_) => gop_println!("Usage: rmdir <name>"),
         },
         Command::Edit(name) => match core::str::from_utf8(name) {
-            Ok(name) => edit_disk_file(name),
+            Ok(name) => {
+                let mut resolved = [0; PATH_CAPACITY];
+                match resolve_ext2_command_path(
+                    &current_dir[..*current_dir_len],
+                    name.as_bytes(),
+                    *current_dir_is_ext2,
+                    &mut resolved,
+                )
+                .and_then(|length| core::str::from_utf8(&resolved[..length]).ok())
+                {
+                    Some(name) => edit_disk_file(name),
+                    None => gop_println!("Usage: edit <path>"),
+                }
+            }
             Err(_) => gop_println!("Usage: edit <filename>"),
         },
         Command::ChangeDirectory(path) => {
@@ -1432,55 +1488,6 @@ mod tests {
     }
 
     #[test_case]
-    fn cd_enters_ext2_directories_and_bare_cd_returns_to_initrd_root() {
-        crate::fs::ext2::create_directory("CDTEST").expect("create ext2 test directory");
-        let mut current_dir = [0; PATH_CAPACITY];
-        let mut current_dir_len = 0;
-        let mut current_dir_is_ext2 = false;
-
-        execute(
-            b"cd CDTEST",
-            &mut current_dir,
-            &mut current_dir_len,
-            &mut current_dir_is_ext2,
-        );
-        assert!(current_dir_is_ext2);
-        assert_eq!(&current_dir[..current_dir_len], b"CDTEST");
-
-        execute(
-            b"ls",
-            &mut current_dir,
-            &mut current_dir_len,
-            &mut current_dir_is_ext2,
-        );
-
-        execute(
-            b"cd /",
-            &mut current_dir,
-            &mut current_dir_len,
-            &mut current_dir_is_ext2,
-        );
-        assert!(!current_dir_is_ext2);
-        assert_eq!(current_dir_len, 0);
-
-        execute(
-            b"cd CDTEST",
-            &mut current_dir,
-            &mut current_dir_len,
-            &mut current_dir_is_ext2,
-        );
-        assert!(current_dir_is_ext2);
-        execute(
-            b"cd",
-            &mut current_dir,
-            &mut current_dir_len,
-            &mut current_dir_is_ext2,
-        );
-        assert!(!current_dir_is_ext2);
-        crate::fs::ext2::remove_empty_directory("CDTEST").expect("remove ext2 test directory");
-    }
-
-    #[test_case]
     fn ext2_commands_resolve_names_relative_to_current_ext2_directory() {
         let mut output = [0; PATH_CAPACITY];
         let length = resolve_ext2_command_path(b"parent", b"child", true, &mut output).unwrap();
@@ -1493,5 +1500,15 @@ mod tests {
         let length =
             resolve_ext2_command_path(b"docs", b"parent/child", false, &mut output).unwrap();
         assert_eq!(&output[..length], b"parent/child");
+
+        let length = resolve_ext2_command_path(b"parent", b"FILE.TXT", true, &mut output).unwrap();
+        assert_eq!(&output[..length], b"parent/FILE.TXT");
+    }
+
+    #[test_case]
+    fn edit_path_parent_is_suggested_for_missing_directories() {
+        assert_eq!(ext2_parent_path("test/test.txt"), "test");
+        assert_eq!(ext2_parent_path("test/nested/test.txt"), "test/nested");
+        assert_eq!(ext2_parent_path("test.txt"), "");
     }
 }

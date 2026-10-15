@@ -683,6 +683,13 @@ fn resolve_parent<'a>(
     if !safe_component(name) {
         return Err(Ext2Error::InvalidPath);
     }
+    if parent_path
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|component| !component.is_empty() && !safe_component(component))
+    {
+        return Err(Ext2Error::InvalidPath);
+    }
     let parent_number = if parent_path.is_empty() || parent_path == "/" {
         ROOT_INODE
     } else {
@@ -845,7 +852,7 @@ fn update_directory_link_count(
     .ok_or(Ext2Error::InvalidFilesystem)?;
     write_inode_fields(
         metadata,
-        ROOT_INODE,
+        inode_number,
         root.mode,
         u32::try_from(root.size).map_err(|_| Ext2Error::UnsupportedFeature)?,
         links,
@@ -1085,10 +1092,7 @@ pub fn remove_empty_directory(path: &str) -> Result<(), Ext2Error> {
 pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
     let _guard = EXT2_WRITE_LOCK.lock();
     let metadata = writable_metadata()?;
-    let name = path.as_bytes();
-    if !safe_component(name) {
-        return Err(Ext2Error::InvalidPath);
-    }
+    let (_, parent, name) = resolve_parent(metadata, path)?;
     let max_file_size = metadata
         .block_size
         .checked_mul(DIRECT_BLOCKS)
@@ -1097,25 +1101,25 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
         return Err(Ext2Error::UnsupportedFeature);
     }
 
-    let existing = lookup(path)?;
-    let (inode_number, existing_inode) = match existing {
-        Some(inode) if inode.mode & 0xf000 == 0x8000 => {
+    let (inode_number, existing_inode) = match find_child(metadata, parent, name)? {
+        Some(inode_number) => {
+            let inode = read_inode(metadata, inode_number)?;
+            if inode.mode & 0xf000 != 0x8000 {
+                return Err(Ext2Error::InvalidPath);
+            }
             if inode.size > max_file_size as u64
                 || inode.single_indirect != 0
                 || inode.double_indirect != 0
             {
                 return Err(Ext2Error::UnsupportedFeature);
             }
-            let inode_number =
-                find_child_number(metadata, name)?.ok_or(Ext2Error::InvalidFilesystem)?;
             (inode_number, Some(inode))
         }
-        Some(_) => return Err(Ext2Error::InvalidPath),
         None => (0, None),
     };
     let new_inode = existing_inode.is_none();
     if new_inode {
-        ensure_directory_entry_space(metadata, read_inode(metadata, ROOT_INODE)?, name)?;
+        ensure_directory_entry_space(metadata, parent, name)?;
     }
 
     let mut descriptor = [0; 4096];
@@ -1223,20 +1227,9 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
         new_inode,
     )?;
     if new_inode {
-        add_directory_entry(
-            metadata,
-            read_inode(metadata, ROOT_INODE)?,
-            name,
-            allocated_inode,
-            1,
-        )?;
+        add_directory_entry(metadata, parent, name, allocated_inode, 1)?;
     }
     Ok(())
-}
-
-fn find_child_number(metadata: Metadata, name: &[u8]) -> Result<Option<u32>, Ext2Error> {
-    let root = read_inode(metadata, ROOT_INODE)?;
-    find_child(metadata, root, name)
 }
 
 fn for_each_child(
