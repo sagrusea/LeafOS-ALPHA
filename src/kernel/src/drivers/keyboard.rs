@@ -241,11 +241,15 @@ impl Keyboard {
         match key {
             KeyCode::Char(c) if c.is_ascii_alphabetic() => {
                 let upper = shifted ^ self.caps_lock;
-                Some(if upper {
+                let mut byte = if upper {
                     c.to_ascii_uppercase() as u8
                 } else {
                     c as u8
-                })
+                };
+                if self.left_ctrl || self.right_ctrl {
+                    byte = byte.to_ascii_uppercase() - b'A' + 1;
+                }
+                Some(byte)
             }
             KeyCode::Char(c) => {
                 let c = if shifted {
@@ -294,5 +298,31 @@ impl Keyboard {
             KeyCode::Escape => Some(0x1B),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test_case]
+    fn decodes_editor_navigation_and_control_shortcuts() {
+        let mut keyboard = Keyboard::new();
+        keyboard.process_scancode(0x1d);
+        assert_eq!(keyboard.process_scancode(0x10).unwrap().ascii, Some(0x11));
+        keyboard.process_scancode(0x90);
+        keyboard.process_scancode(0x9d);
+
+        keyboard.process_scancode(0x1d);
+        assert_eq!(keyboard.process_scancode(0x2e).unwrap().ascii, Some(0x03));
+        keyboard.process_scancode(0xae);
+        assert_eq!(keyboard.process_scancode(0x1f).unwrap().ascii, Some(0x13));
+        keyboard.process_scancode(0x9f);
+        keyboard.process_scancode(0x9d);
+
+        keyboard.process_scancode(0xe0);
+        let left = keyboard.process_scancode(0x4b).unwrap();
+        assert_eq!(left.code, KeyCode::ArrowLeft);
+        assert_eq!(left.ascii, None);
     }
 }

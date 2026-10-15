@@ -5,8 +5,10 @@
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
+extern crate alloc;
+
 use core::panic::PanicInfo;
-use x86::io::outl;
+use x86::io::{outl, outw};
 
 pub mod boot_info;
 pub mod drivers;
@@ -17,6 +19,7 @@ pub mod interrupts;
 pub mod memory;
 pub mod serial;
 pub mod shell;
+pub mod timer;
 pub mod vga_buffer;
 
 pub trait Testable {
@@ -77,10 +80,19 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
     }
 }
 
+pub fn shutdown() -> ! {
+    x86_64::instructions::interrupts::disable();
+    unsafe {
+        outw(0x604, 0x2000);
+    }
+    hlt_loop()
+}
+
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
     unsafe { interrupts::PICS.lock().initialize() };
+    timer::init();
     x86_64::instructions::interrupts::enable();
 }
 

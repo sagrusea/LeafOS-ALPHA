@@ -1131,7 +1131,7 @@ static EFI_STATUS LoadInitrd(BootInfo *Info)
     EFI_FILE_PROTOCOL *File = NULL;
     EFI_FILE_INFO *FileInfo = NULL;
     EFI_GUID FileInfoGuid = EFI_FILE_INFO_GUID;
-    static const CHAR16 Path[] = {
+    static CHAR16 Path[] = {
         '\\', 'E', 'F', 'I', '\\', 'B', 'O', 'O', 'T', '\\',
         'i', 'n', 'i', 't', 'r', 'd', '.', 't', 'a', 'r', 0
     };

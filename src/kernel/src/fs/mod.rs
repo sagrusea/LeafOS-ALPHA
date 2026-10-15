@@ -3,6 +3,8 @@ use spin::Once;
 
 use crate::boot_info::BootInfo;
 
+pub mod ext2;
+
 const MAX_ARCHIVE_SIZE: usize = 16 * 1024 * 1024;
 const BLOCK_SIZE: usize = 512;
 const MAX_FILES: usize = 256;

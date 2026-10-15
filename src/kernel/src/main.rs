@@ -41,6 +41,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     serial_println!("[OK] Kernel heap initialized");
 
+    match kernel::fs::ext2::initialize() {
+        Ok(()) => {
+            serial_println!("[OK] Read-only ext2 data disk mounted");
+        }
+        Err(error) => {
+            serial_println!("[WARN] ext2 data disk unavailable: {:?}", error);
+        }
+    }
+
     let framebuffer = unsafe { FramebufferInfo::from_boot_info(boot_info) };
 
     match framebuffer {
@@ -52,7 +61,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
                 fb_info.buffer.addr()
             );
             framebuffer::init(fb_info);
-            gop_println!("LEAFOS ALPHA build 2A2");
+            gop_println!("LEAFOS ALPHA build 2A4b");
             gop_println!("KERNEL BOOT OK");
         }
         None => {

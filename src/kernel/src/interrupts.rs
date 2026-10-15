@@ -54,7 +54,7 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    //gop_print!(".");
+    crate::timer::on_interrupt();
 
     unsafe {
         PICS.lock()
@@ -76,7 +76,7 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    use crate::drivers::{KeyState, Keyboard};
+    use crate::drivers::{KeyCode, KeyState, Keyboard};
     use x86_64::instructions::port::Port;
 
     static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
@@ -89,8 +89,24 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     if let Some(event) = keyboard.process_scancode(scancode) {
         if event.state == KeyState::Pressed {
             if let Some(byte) = event.ascii {
-                if byte == b'\n' || byte == 0x08 || byte == 0x03 || (0x20..=0x7e).contains(&byte) {
+                if matches!(byte, b'\n' | b'\t' | 0x08 | 0x03 | 0x11 | 0x13 | 0x1b)
+                    || (0x20..=0x7e).contains(&byte)
+                {
                     shell::enqueue_key(byte);
+                }
+            } else {
+                let special_key = match event.code {
+                    KeyCode::ArrowLeft => Some(0x80),
+                    KeyCode::ArrowRight => Some(0x81),
+                    KeyCode::ArrowUp => Some(0x82),
+                    KeyCode::ArrowDown => Some(0x83),
+                    KeyCode::Home => Some(0x84),
+                    KeyCode::End => Some(0x85),
+                    KeyCode::Delete => Some(0x86),
+                    _ => None,
+                };
+                if let Some(key) = special_key {
+                    shell::enqueue_key(key);
                 }
             }
         }

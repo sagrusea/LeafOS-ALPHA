@@ -27,6 +27,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         unsafe { kernel::memory::initialize(boot_info) }.expect("initialize memory manager");
         unsafe { kernel::fs::initialize(boot_info) }.expect("validate initrd");
         unsafe { kernel::memory::heap::initialize() }.expect("initialize kernel heap");
+        kernel::fs::ext2::initialize().expect("mount ext2 test disk");
     }
     test_main();
 
@@ -199,6 +200,177 @@ fn test_initrd_lists_and_reads_files() {
             .contains("directories")
     );
     assert!(!kernel::fs::directory_exists("../docs").expect("reject traversal path"));
+}
+
+#[test_case]
+fn test_ext2_lists_and_reads_files() {
+    let mut found_docs = false;
+    kernel::fs::ext2::for_each_entry("", |name, is_dir, _| {
+        found_docs |= name == "docs" && is_dir;
+    })
+    .expect("list ext2 root");
+    assert!(found_docs);
+
+    let mut found_about = false;
+    kernel::fs::ext2::for_each_entry("docs", |name, is_dir, _| {
+        found_about |= name == "ABOUT.TXT" && !is_dir;
+    })
+    .expect("list ext2 nested directory");
+    assert!(found_about);
+
+    let mut contents = [0; 512];
+    let (copied, total) = kernel::fs::ext2::read_file("docs/ABOUT.TXT", &mut contents)
+        .expect("read ext2 file")
+        .expect("ext2 file exists");
+    assert_eq!(usize::try_from(total).unwrap(), copied);
+    assert!(
+        core::str::from_utf8(&contents[..copied])
+            .expect("ext2 file is UTF-8")
+            .contains("directories")
+    );
+    assert!(
+        kernel::fs::ext2::read_file("../README.TXT", &mut contents)
+            .expect("reject ext2 path traversal")
+            .is_none()
+    );
+
+    let mut indirect_contents = Vec::new();
+    indirect_contents.resize(300 * 1024, 0);
+    let (copied, total) =
+        kernel::fs::ext2::read_file("__ext2_test__/INDIRECT.TXT", &mut indirect_contents)
+            .expect("read ext2 double-indirect file")
+            .expect("double-indirect test file exists");
+    assert_eq!(copied, indirect_contents.len());
+    assert_eq!(usize::try_from(total).unwrap(), copied);
+    for index in [0, 12 * 1024, 268 * 1024, copied - 1] {
+        assert_eq!(indirect_contents[index], b'A' + (index % 26) as u8);
+    }
+
+    let mut wide_count = 0;
+    let mut found_last = false;
+    kernel::fs::ext2::for_each_entry("__ext2_test__/wide", |name, is_dir, _| {
+        assert!(!is_dir);
+        wide_count += 1;
+        found_last |= name == "ENTRY69.TXT";
+    })
+    .expect("list multi-block ext2 directory");
+    assert_eq!(wide_count, 70);
+    assert!(found_last);
+}
+
+#[test_case]
+fn test_ext2_creates_and_replaces_small_root_files() {
+    use kernel::fs::ext2::{self, Ext2Error};
+
+    ext2::write_file("WRITE.TXT", b"first write").expect("create ext2 root file");
+    ext2::write_file("WRITE.TXT", b"replaced").expect("replace ext2 root file");
+
+    let mut contents = [0; 32];
+    let (copied, total) = ext2::read_file("WRITE.TXT", &mut contents)
+        .expect("read newly written ext2 file")
+        .expect("new file exists");
+    assert_eq!(total, 8);
+    assert_eq!(&contents[..copied], b"replaced");
+
+    ext2::write_file("EMPTY.TXT", b"").expect("create empty ext2 file");
+    assert_eq!(
+        ext2::read_file("EMPTY.TXT", &mut contents)
+            .expect("read empty ext2 file")
+            .expect("empty file exists"),
+        (0, 0)
+    );
+
+    let large_contents = [b'X'; 2500];
+    ext2::write_file("WRITE.TXT", &large_contents).expect("extend file across ext2 blocks");
+    let mut large_output = [0; 2500];
+    let (copied, total) = ext2::read_file("WRITE.TXT", &mut large_output)
+        .expect("read multi-block ext2 file")
+        .expect("multi-block file exists");
+    assert_eq!(copied, large_contents.len());
+    assert_eq!(total, large_contents.len() as u64);
+    assert_eq!(large_output, large_contents);
+
+    ext2::write_file("WRITE.TXT", b"short replacement")
+        .expect("shrink existing multi-block ext2 file");
+    let (copied, total) = ext2::read_file("WRITE.TXT", &mut contents)
+        .expect("read shrunk ext2 file")
+        .expect("shrunk file exists");
+    assert_eq!(total, 17);
+    assert_eq!(&contents[..copied], b"short replacement");
+
+    let max_contents = [b'Y'; 12 * 1024];
+    ext2::write_file("MAXIMUM.TXT", &max_contents).expect("write twelve direct blocks");
+    let mut max_output = [0; 12 * 1024];
+    let (copied, total) = ext2::read_file("MAXIMUM.TXT", &mut max_output)
+        .expect("read twelve direct blocks")
+        .expect("maximum-size file exists");
+    assert_eq!(copied, max_contents.len());
+    assert_eq!(total, max_contents.len() as u64);
+    assert_eq!(max_output, max_contents);
+
+    assert_eq!(
+        ext2::write_file("../OUTSIDE.TXT", b"x"),
+        Err(Ext2Error::InvalidPath)
+    );
+    assert_eq!(ext2::write_file("docs", b"x"), Err(Ext2Error::InvalidPath));
+    assert_eq!(
+        ext2::write_file("TOO-LARGE.TXT", &[0; 12 * 1024 + 1]),
+        Err(Ext2Error::UnsupportedFeature)
+    );
+}
+
+#[test_case]
+fn test_ext2_creates_and_removes_root_entries_safely() {
+    use kernel::fs::ext2::{self, Ext2Error};
+
+    ext2::create_directory("EMPTYDIR").expect("create ext2 directory");
+    assert!(ext2::directory_exists("EMPTYDIR").expect("check new directory"));
+    assert_eq!(
+        ext2::create_directory("EMPTYDIR"),
+        Err(Ext2Error::AlreadyExists)
+    );
+    assert_eq!(
+        ext2::remove_empty_directory("docs"),
+        Err(Ext2Error::NotEmpty)
+    );
+    ext2::remove_empty_directory("EMPTYDIR").expect("remove empty directory");
+    assert!(!ext2::directory_exists("EMPTYDIR").expect("check removed directory"));
+    assert_eq!(
+        ext2::remove_empty_directory("EMPTYDIR"),
+        Err(Ext2Error::NotFound)
+    );
+    assert_eq!(
+        ext2::create_directory("../OUTSIDE"),
+        Err(Ext2Error::InvalidPath)
+    );
+
+    ext2::create_directory("PARENT").expect("create parent directory");
+    ext2::create_directory("PARENT/CHILD").expect("create nested directory");
+    assert!(ext2::directory_exists("PARENT/CHILD").expect("check nested directory"));
+    assert_eq!(
+        ext2::remove_empty_directory("PARENT"),
+        Err(Ext2Error::NotEmpty)
+    );
+    ext2::remove_empty_directory("PARENT/CHILD").expect("remove nested directory");
+    ext2::remove_empty_directory("PARENT").expect("remove parent directory");
+
+    ext2::write_file("DELETE.TXT", b"delete me").expect("create file for removal");
+    assert_eq!(
+        ext2::remove_empty_directory("DELETE.TXT"),
+        Err(Ext2Error::InvalidPath)
+    );
+    ext2::remove_file("DELETE.TXT").expect("remove file");
+    let mut contents = [0; 16];
+    assert_eq!(
+        ext2::read_file("DELETE.TXT", &mut contents).expect("read removed file"),
+        None
+    );
+    assert_eq!(ext2::remove_file("DELETE.TXT"), Err(Ext2Error::NotFound));
+    assert_eq!(ext2::remove_file("docs"), Err(Ext2Error::InvalidPath));
+    assert_eq!(
+        ext2::remove_file("../DELETE.TXT"),
+        Err(Ext2Error::InvalidPath)
+    );
 }
 
 #[alloc_error_handler]
