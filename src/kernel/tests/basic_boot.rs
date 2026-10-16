@@ -151,9 +151,17 @@ fn test_mapping_with_uefi_frame_allocator() {
         }
 
         unsafe { manager.unmap_and_deallocate(page) }.expect("unmap and reclaim the frame");
-        assert_eq!(
-            manager.allocate_frame(),
-            Some(frame),
+        let mut reclaimed = [None; 4];
+        for slot in &mut reclaimed {
+            *slot = manager.allocate_frame();
+        }
+        let frame_was_reclaimed = reclaimed.contains(&Some(frame));
+        for reclaimed_frame in reclaimed.into_iter().flatten() {
+            unsafe { manager.deallocate_frame(reclaimed_frame) }
+                .expect("return inspected frame to the allocator");
+        }
+        assert!(
+            frame_was_reclaimed,
             "unmapped physical frame should be reusable"
         );
     })

@@ -20,6 +20,8 @@ const PAGE_SIZE: u64 = 4096;
 const PAGE_MASK: u64 = PAGE_SIZE - 1;
 const EFI_DESCRIPTOR_MIN_SIZE: usize = 40;
 const RECLAIMED_FRAME_CAPACITY: usize = 260;
+// One unmapped leaf frame plus up to three now-empty lower-level page tables.
+const MAX_FRAMES_RECLAIMED_PER_UNMAP: usize = 4;
 const EFI_MEMORY_MAP_VERSION: u32 = 2;
 const EFI_MEMORY_DESCRIPTOR_VERSION: u32 = 1;
 
@@ -343,6 +345,56 @@ impl<'a> BootInfoFrameAllocator<'a> {
         }
     }
 
+    /// Counts cached frames plus conventional frames not yet visited by the
+    /// allocator cursor. Reserved ranges are subtracted for manually-built test
+    /// allocators too, even though production construction rejects such overlap.
+    fn available_frame_count(&self) -> usize {
+        let mut total = self.reclaimed_count;
+        let mut reserved_ranges = self.reserved_ranges;
+        reserved_ranges.sort_unstable_by_key(|reserved| reserved.start);
+
+        for index in self.descriptor_index..self.descriptor_count {
+            let descriptor = read_descriptor(self.memory_map, self.descriptor_size, index)
+                .expect("validated UEFI memory-map descriptor");
+            if descriptor.memory_type != EFI_CONVENTIONAL_MEMORY {
+                continue;
+            }
+
+            let first_page = if index == self.descriptor_index {
+                self.page_index
+            } else {
+                0
+            };
+            if first_page >= descriptor.number_of_pages {
+                continue;
+            }
+
+            let start = descriptor.physical_start + first_page * PAGE_SIZE;
+            let end = descriptor.physical_start + descriptor.number_of_pages * PAGE_SIZE;
+            let range = PhysicalRange { start, end };
+            let mut pages = descriptor.number_of_pages - first_page;
+
+            // Count the union of reserved overlap, not each range independently;
+            // two reserved boot objects can occupy the same physical page.
+            let mut reserved_cursor = range.start;
+            for reserved in reserved_ranges {
+                let overlap_start = range.start.max(reserved.start);
+                let overlap_end = range.end.min(reserved.end);
+                if overlap_start < overlap_end {
+                    let unique_start = overlap_start.max(reserved_cursor);
+                    if unique_start < overlap_end {
+                        pages = pages.saturating_sub((overlap_end - unique_start) / PAGE_SIZE);
+                    }
+                    reserved_cursor = reserved_cursor.max(overlap_end);
+                }
+            }
+
+            total = total.saturating_add(usize::try_from(pages).unwrap_or(usize::MAX));
+        }
+
+        total
+    }
+
     fn is_allocatable_frame(&self, frame: PhysFrame<Size4KiB>) -> bool {
         let address = frame.start_address().as_u64();
         if address >= self.physical_limit
@@ -402,6 +454,12 @@ impl MemoryManager<'_> {
         self.frame_allocator.allocate_frame()
     }
 
+    /// Number of physical frames currently available from the reclaim cache and
+    /// the unvisited portion of conventional memory. Call under the manager lock.
+    pub fn available_frame_count(&self) -> usize {
+        self.frame_allocator.available_frame_count()
+    }
+
     /// Returns a frame previously allocated by this manager to its allocator.
     ///
     /// # Safety
@@ -427,6 +485,10 @@ impl MemoryManager<'_> {
             .level_4_table()
             .iter()
             .enumerate()
+            // Only indices 1..256 are canonical lower-half PML4 slots. Index 0
+            // is deliberately skipped to keep the null/low-address region out
+            // of allocator-owned virtual memory.
+            .take(256)
             .skip(1)
             .find(|(_, entry)| entry.is_unused())
             .map(|(index, _)| Page::containing_address(VirtAddr::new((index as u64) << 39)))
@@ -517,7 +579,12 @@ impl MemoryManager<'_> {
         &mut self,
         page: Page<Size4KiB>,
     ) -> Result<(), UnmappingError> {
-        if self.frame_allocator.reclaimed_count == RECLAIMED_FRAME_CAPACITY {
+        // Unmapping may prune up to three empty page-table pages as well as
+        // returning the leaf frame. Reserve capacity before changing any mapping
+        // so reclamation cannot panic halfway through the operation.
+        if self.frame_allocator.reclaimed_count
+            > RECLAIMED_FRAME_CAPACITY - MAX_FRAMES_RECLAIMED_PER_UNMAP
+        {
             return Err(UnmappingError::ReclaimCapacityExceeded);
         }
         let mapped_address = self
@@ -533,6 +600,19 @@ impl MemoryManager<'_> {
         assert_eq!(unmapped_frame, frame, "mapping changed during unmap");
         flush.flush();
         assert!(self.frame_allocator.reclaim_frame(frame));
+
+        // Reclaim any page-table pages made empty by removing this mapping. This
+        // is especially important when a failed heap growth rolls back all of
+        // its leaf mappings: otherwise each failed attempt leaks page tables.
+        unsafe {
+            self.mapper.clean_up_addr_range(
+                PageRangeInclusive {
+                    start: page,
+                    end: page,
+                },
+                &mut self.frame_allocator,
+            );
+        }
         Ok(())
     }
 }
@@ -772,24 +852,80 @@ mod tests {
             reclaimed_count: 0,
         };
 
+        assert_eq!(allocator.available_frame_count(), 3);
         assert_eq!(
             allocator
                 .allocate_frame()
                 .map(|frame| frame.start_address().as_u64()),
             Some(0x1000)
         );
+        assert_eq!(allocator.available_frame_count(), 2);
         assert_eq!(
             allocator
                 .allocate_frame()
                 .map(|frame| frame.start_address().as_u64()),
             Some(0x3000)
         );
+        assert_eq!(allocator.available_frame_count(), 1);
         assert_eq!(
             allocator
                 .allocate_frame()
                 .map(|frame| frame.start_address().as_u64()),
             Some(0x4000)
         );
+        assert_eq!(allocator.available_frame_count(), 0);
         assert_eq!(allocator.allocate_frame(), None);
+    }
+
+    #[test_case]
+    fn reclaimed_frame_allocator_round_trips_frames_under_stress() {
+        const FRAME_COUNT: usize = 128;
+        const ROUNDS: usize = 100;
+
+        let (bytes, length) = map_bytes(
+            &[descriptor(EFI_CONVENTIONAL_MEMORY, 0x1000, FRAME_COUNT as u64)],
+            EFI_DESCRIPTOR_MIN_SIZE,
+        );
+        let mut allocator = BootInfoFrameAllocator {
+            memory_map: &bytes[..length],
+            descriptor_size: EFI_DESCRIPTOR_MIN_SIZE,
+            descriptor_count: 1,
+            descriptor_index: 0,
+            page_index: 0,
+            physical_limit: 1 << 32,
+            reserved_ranges: [PhysicalRange::EMPTY; 6],
+            reclaimed_frames: [None; RECLAIMED_FRAME_CAPACITY],
+            reclaimed_count: 0,
+        };
+
+        assert_eq!(allocator.available_frame_count(), FRAME_COUNT);
+
+        let mut original = [None; FRAME_COUNT];
+        for slot in &mut original {
+            *slot = allocator.allocate_frame();
+            assert!(slot.is_some());
+        }
+        assert_eq!(allocator.allocate_frame(), None);
+        assert_eq!(allocator.available_frame_count(), 0);
+
+        for frame in original.iter().flatten().copied() {
+            assert!(allocator.reclaim_frame(frame));
+        }
+        assert_eq!(allocator.available_frame_count(), FRAME_COUNT);
+
+        for _ in 0..ROUNDS {
+            // Reclaiming in reverse order restores the same LIFO stack after
+            // each complete drain, allowing both order and uniqueness checks.
+            for index in (0..FRAME_COUNT).rev() {
+                let frame = allocator.allocate_frame().expect("reclaimed frame missing");
+                assert_eq!(Some(frame), original[index]);
+            }
+            assert_eq!(allocator.allocate_frame(), None);
+            for frame in original.iter().flatten().copied() {
+                assert!(allocator.reclaim_frame(frame));
+            }
+            assert_eq!(allocator.reclaimed_count, FRAME_COUNT);
+            assert_eq!(allocator.available_frame_count(), FRAME_COUNT);
+        }
     }
 }
