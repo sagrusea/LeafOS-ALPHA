@@ -1,11 +1,11 @@
-use spin::Lazy;
+use crate::sync::Lazy;
 use x86_64::VirtAddr;
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-const STACK_SIZE: usize = 4096 * 5;
+const STACK_SIZE: usize = 64 * 1024;
 
 static mut DOUBLE_FAULT_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
 

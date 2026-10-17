@@ -1,5 +1,5 @@
-use spin::Mutex;
-use spin::lazy::Lazy;
+use crate::sync::Lazy;
+use crate::sync::Mutex;
 use uart_16550::{Config, Uart16550Tty, backend::PioBackend};
 
 pub static SERIAL1: Lazy<Mutex<Uart16550Tty<PioBackend>>> = Lazy::new(|| {

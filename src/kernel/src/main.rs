@@ -72,8 +72,35 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     kernel::init();
+    serial_println!("[OK] Essential kernel startup complete");
+    serial_println!("[INFO] Starting shell as a scheduled kernel task");
 
-    kernel::shell::run();
+    let shell_task = match kernel::scheduler::spawn(shell_service) {
+        Ok(task) => task,
+        Err(error) => {
+            serial_println!("[FATAL] Failed to schedule shell task: {:?}", error);
+            kernel::hlt_loop();
+        }
+    };
+
+    if let Err(error) = kernel::scheduler::run_tasks() {
+        serial_println!(
+            "[FATAL] Scheduler failed while running shell task {}: {:?}",
+            shell_task.get(),
+            error
+        );
+        kernel::hlt_loop();
+    }
+
+    serial_println!(
+        "[FATAL] Scheduler returned after shell task {} unexpectedly",
+        shell_task.get()
+    );
+    kernel::hlt_loop();
+}
+
+fn shell_service() {
+    kernel::shell::run()
 }
 
 #[cfg(not(test))]

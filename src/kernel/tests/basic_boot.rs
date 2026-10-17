@@ -1,14 +1,13 @@
 #![no_std]
 #![no_main]
 #![feature(custom_test_frameworks)]
-#![feature(alloc_error_handler)]
 #![test_runner(kernel::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
 extern crate alloc;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use core::sync::atomic::{AtomicPtr, Ordering};
 use kernel::boot_info::BootInfo;
 use kernel::scheduler::{self, TaskId, TaskState};
@@ -22,6 +21,40 @@ use x86_64::{
 static BOOT_INFO: AtomicPtr<BootInfo> = AtomicPtr::new(core::ptr::null_mut());
 static SCHEDULER_EVENT_INDEX: AtomicUsize = AtomicUsize::new(0);
 static SCHEDULER_EVENTS: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+static SCHEDULER_TASK_ENTERED_BLOCK: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_TASK_RESUMED: AtomicBool = AtomicBool::new(false);
+static SCHEDULER_WAKER_RESUMED: AtomicBool = AtomicBool::new(false);
+static BLOCKED_TASK_ID: kernel::sync::Mutex<Option<TaskId>> = kernel::sync::Mutex::new(None);
+static PREEMPT_FIRST_STARTED: AtomicBool = AtomicBool::new(false);
+static PREEMPT_SECOND_RAN: AtomicBool = AtomicBool::new(false);
+static PREEMPT_FIRST_FINISHED: AtomicBool = AtomicBool::new(false);
+static PREEMPT_FIRST_LOCAL: AtomicU64 = AtomicU64::new(0);
+static TASKED_EXT2_DIRECTORY_CREATED: AtomicBool = AtomicBool::new(false);
+
+fn create_and_remove_ext2_directory_task() {
+    kernel::fs::ext2::create_directory("TASKDIR").expect("create directory in scheduled task");
+    TASKED_EXT2_DIRECTORY_CREATED.store(true, Ordering::SeqCst);
+    kernel::fs::ext2::remove_empty_directory("TASKDIR")
+        .expect("remove directory in scheduled task");
+}
+
+fn preempted_cpu_bound_task() {
+    PREEMPT_FIRST_STARTED.store(true, Ordering::SeqCst);
+    let mut local = 0x1234_5678_9abc_def0u64;
+    while !PREEMPT_SECOND_RAN.load(Ordering::SeqCst) {
+        local = local.rotate_left(7) ^ 0xfeed_face_cafe_beef;
+        core::hint::spin_loop();
+    }
+    PREEMPT_FIRST_LOCAL.store(local, Ordering::SeqCst);
+    PREEMPT_FIRST_FINISHED.store(true, Ordering::SeqCst);
+}
+
+fn preempting_peer_task() {
+    while !PREEMPT_FIRST_STARTED.load(Ordering::SeqCst) {
+        core::hint::spin_loop();
+    }
+    PREEMPT_SECOND_RAN.store(true, Ordering::SeqCst);
+}
 
 fn record_scheduler_event(value: usize) {
     let index = SCHEDULER_EVENT_INDEX.fetch_add(1, Ordering::SeqCst);
@@ -41,6 +74,19 @@ fn second_kernel_task() {
     record_scheduler_event(4);
 }
 
+fn blocking_kernel_task() {
+    SCHEDULER_TASK_ENTERED_BLOCK.store(true, Ordering::SeqCst);
+    scheduler::block_now().expect("block and switch to waker task");
+    SCHEDULER_TASK_RESUMED.store(true, Ordering::SeqCst);
+}
+
+fn waking_kernel_task() {
+    let blocked = (*BLOCKED_TASK_ID.lock()).expect("blocked task ID was not set");
+    scheduler::wake_task(blocked).expect("wake blocked task");
+    scheduler::yield_now().expect("yield to the unblocked task");
+    SCHEDULER_WAKER_RESUMED.store(true, Ordering::SeqCst);
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
@@ -51,6 +97,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         unsafe { kernel::memory::heap::initialize() }.expect("initialize kernel heap");
         kernel::fs::ext2::initialize().expect("mount ext2 test disk");
     }
+    kernel::init();
     test_main();
 
     loop {}
@@ -81,6 +128,69 @@ fn test_cooperative_tasks_yield_terminate_and_return_to_bootstrap() {
     assert_eq!(scheduler::task_state(second), Ok(TaskState::Terminated));
     scheduler::reap_terminated(first).expect("reap first task");
     scheduler::reap_terminated(second).expect("reap second task");
+
+    SCHEDULER_TASK_ENTERED_BLOCK.store(false, Ordering::SeqCst);
+    SCHEDULER_TASK_RESUMED.store(false, Ordering::SeqCst);
+    SCHEDULER_WAKER_RESUMED.store(false, Ordering::SeqCst);
+    let blocked = scheduler::spawn(blocking_kernel_task).expect("spawn blocking task");
+    *BLOCKED_TASK_ID.lock() = Some(blocked);
+    let waker = scheduler::spawn(waking_kernel_task).expect("spawn waking task");
+
+    scheduler::run_tasks().expect("blocked task wakes and returns to bootstrap");
+    assert!(SCHEDULER_TASK_ENTERED_BLOCK.load(Ordering::SeqCst));
+    assert!(SCHEDULER_TASK_RESUMED.load(Ordering::SeqCst));
+    assert!(SCHEDULER_WAKER_RESUMED.load(Ordering::SeqCst));
+    assert_eq!(scheduler::task_state(blocked), Ok(TaskState::Terminated));
+    assert_eq!(scheduler::task_state(waker), Ok(TaskState::Terminated));
+    scheduler::reap_terminated(blocked).expect("reap blocked task");
+    scheduler::reap_terminated(waker).expect("reap waker task");
+    *BLOCKED_TASK_ID.lock() = None;
+    assert_eq!(
+        scheduler::task_state(blocked),
+        Err(scheduler::SchedulerError::UnknownTask)
+    );
+}
+
+#[test_case]
+fn test_timer_preempts_cpu_bound_tasks_and_restores_their_context() {
+    PREEMPT_FIRST_STARTED.store(false, Ordering::SeqCst);
+    PREEMPT_SECOND_RAN.store(false, Ordering::SeqCst);
+    PREEMPT_FIRST_FINISHED.store(false, Ordering::SeqCst);
+    PREEMPT_FIRST_LOCAL.store(0, Ordering::SeqCst);
+    let tick_before = kernel::timer::ticks();
+
+    let first = scheduler::spawn(preempted_cpu_bound_task).expect("spawn CPU-bound task");
+    let second = scheduler::spawn(preempting_peer_task).expect("spawn peer task");
+    scheduler::run_tasks().expect("timer-preempted tasks should finish");
+
+    assert!(PREEMPT_FIRST_STARTED.load(Ordering::SeqCst));
+    assert!(PREEMPT_SECOND_RAN.load(Ordering::SeqCst));
+    assert!(PREEMPT_FIRST_FINISHED.load(Ordering::SeqCst));
+    assert_ne!(PREEMPT_FIRST_LOCAL.load(Ordering::SeqCst), 0);
+    assert!(kernel::timer::ticks().wrapping_sub(tick_before) > 0);
+    assert_eq!(scheduler::task_state(first), Ok(TaskState::Terminated));
+    assert_eq!(scheduler::task_state(second), Ok(TaskState::Terminated));
+    scheduler::reap_terminated(first).expect("reap first preempted task");
+    scheduler::reap_terminated(second).expect("reap second preempted task");
+}
+
+#[test_case]
+fn test_kernel_mutex_disables_interrupts_until_unlock() {
+    let mutex = kernel::sync::Mutex::new(());
+    assert!(x86_64::instructions::interrupts::are_enabled());
+    {
+        let _guard = mutex.lock();
+        assert!(!x86_64::instructions::interrupts::are_enabled());
+    }
+    assert!(x86_64::instructions::interrupts::are_enabled());
+
+    x86_64::instructions::interrupts::disable();
+    {
+        let _guard = mutex.lock();
+        assert!(!x86_64::instructions::interrupts::are_enabled());
+    }
+    assert!(!x86_64::instructions::interrupts::are_enabled());
+    x86_64::instructions::interrupts::enable();
 }
 
 #[panic_handler]
@@ -470,7 +580,26 @@ fn test_ext2_creates_and_removes_root_entries_safely() {
     );
 }
 
-#[alloc_error_handler]
+#[test_case]
+fn test_scheduled_task_can_create_and_remove_ext2_directory() {
+    TASKED_EXT2_DIRECTORY_CREATED.store(false, Ordering::SeqCst);
+    let task =
+        scheduler::spawn(create_and_remove_ext2_directory_task).expect("spawn ext2 directory task");
+
+    scheduler::run_tasks().expect("run ext2 directory task");
+
+    assert!(TASKED_EXT2_DIRECTORY_CREATED.load(Ordering::SeqCst));
+    assert_eq!(scheduler::task_state(task), Ok(TaskState::Terminated));
+    assert!(!kernel::fs::ext2::directory_exists("TASKDIR").expect("check removed directory"));
+    scheduler::reap_terminated(task).expect("reap ext2 directory task");
+}
+
+#[unsafe(no_mangle)]
+extern "Rust" fn __rust_alloc_error_handler(size: usize, align: usize) -> ! {
+    let layout = unsafe { core::alloc::Layout::from_size_align_unchecked(size, align) };
+    allocation_error(layout)
+}
+
 fn allocation_error(_: core::alloc::Layout) -> ! {
     panic!("test heap allocation failed");
 }

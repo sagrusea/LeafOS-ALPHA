@@ -18,6 +18,7 @@ pub mod fs;
 pub mod memory;
 pub mod misc;
 pub mod shell;
+pub mod sync;
 pub mod tasking;
 pub mod time;
 
@@ -59,7 +60,11 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 #[cfg(test)]
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
-pub extern "C" fn _start() -> ! {
+pub extern "C" fn _start(boot_info: *const boot_info::BootInfo) -> ! {
+    let boot_info = unsafe { boot_info::BootInfo::from_ptr(boot_info) }
+        .expect("test boot requires valid BootInfo");
+    unsafe { memory::initialize(boot_info) }.expect("initialize physical memory manager");
+    unsafe { memory::heap::initialize() }.expect("initialize kernel heap");
     init();
     test_main();
     hlt_loop();

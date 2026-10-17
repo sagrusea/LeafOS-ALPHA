@@ -1,8 +1,8 @@
 use crate::boot_info::{self, BootInfo};
 use crate::misc::font::get_glyph;
+use crate::sync::{Mutex, Once};
 use core::fmt;
 use core::ptr::NonNull;
-use spin::{Mutex, Once};
 
 #[derive(Debug, Clone, Copy)]
 pub struct FramebufferBuffer {

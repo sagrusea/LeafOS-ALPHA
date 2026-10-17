@@ -3,9 +3,7 @@ use crate::gdt;
 use crate::gop_println;
 use crate::hlt_loop;
 use crate::shell;
-use spin;
-use spin::Lazy;
-use spin::Mutex;
+use crate::sync::{Lazy, Mutex};
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 pub const PIC_1_OFFSET: u8 = 32;
@@ -60,6 +58,8 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
         PICS.lock()
             .signal_eoi(InterruptIndex::Timer.as_u8() - PIC_1_OFFSET);
     }
+
+    crate::tasking::scheduler::preempt_from_timer();
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -118,8 +118,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 }
 
-pub static PICS: spin::Mutex<Pic8259> =
-    spin::Mutex::new(unsafe { Pic8259::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+pub static PICS: Mutex<Pic8259> = Mutex::new(unsafe { Pic8259::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 #[test_case]
 fn test_breakpoint_exception() {

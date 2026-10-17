@@ -29,7 +29,17 @@ pub fn uptime_seconds() -> u64 {
     ticks() / TICKS_PER_SECOND
 }
 
+/// Sleep the current scheduled task for `duration` PIT ticks.
+/// Outside a scheduled kernel task, this returns `NotStarted`.
 pub fn sleep_ticks(duration: u64) {
+    match crate::tasking::scheduler::sleep_ticks(duration) {
+        Ok(()) => return,
+        Err(crate::tasking::scheduler::SchedulerError::NotStarted) => {}
+        Err(error) => panic!("task sleep failed: {:?}", error),
+    }
+
+    // Bootstrap/test code may sleep before the scheduler is started. Once a
+    // task is running, the scheduler path above blocks instead of polling.
     let start = ticks();
     while ticks().wrapping_sub(start) < duration {
         x86_64::instructions::interrupts::enable_and_hlt();

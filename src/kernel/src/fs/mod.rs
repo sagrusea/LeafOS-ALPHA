@@ -1,5 +1,5 @@
+use crate::sync::Once;
 use core::slice;
-use spin::Once;
 
 use crate::boot_info::BootInfo;
 

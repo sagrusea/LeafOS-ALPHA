@@ -1,4 +1,4 @@
-use spin::Mutex;
+use crate::sync::Mutex;
 use x86_64::instructions::{interrupts, port::Port};
 
 const DATA: u16 = 0x1f0;

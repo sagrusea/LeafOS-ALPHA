@@ -1,8 +1,8 @@
+use crate::sync::Mutex;
 use core::alloc::{GlobalAlloc, Layout};
 use core::convert::TryFrom;
 use core::ptr;
 use linked_list_allocator::Heap;
-use spin::Mutex;
 use x86_64::{
     VirtAddr,
     structures::paging::{Page, PageTableFlags},

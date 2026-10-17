@@ -1,4 +1,5 @@
-use spin::{Mutex, Once};
+use crate::sync::Mutex;
+use crate::sync::Once;
 use x86_64::{
     PhysAddr, VirtAddr,
     registers::control::Cr3,

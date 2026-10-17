@@ -1,6 +1,6 @@
+use crate::sync::Lazy;
+use crate::sync::Mutex;
 use core::fmt;
-use spin::Mutex;
-use spin::lazy::Lazy;
 
 pub static WRITER: Lazy<Mutex<Writer>> = Lazy::new(|| {
     Mutex::new(Writer {
