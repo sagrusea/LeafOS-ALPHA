@@ -75,7 +75,9 @@ fn growth_pages_for_layout(layout: Layout) -> Option<(usize, usize)> {
 }
 
 fn ceil_div(value: usize, divisor: usize) -> Option<usize> {
-    value.checked_add(divisor.checked_sub(1)?)?.checked_div(divisor)
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
 }
 
 fn added_table_pages(
@@ -195,10 +197,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
                     Some(count) => count,
                     None => return ptr::null_mut(),
                 };
-                let available_frames = match super::with_manager(|manager| manager.available_frame_count()) {
-                    Ok(count) => count,
-                    Err(_) => return ptr::null_mut(),
-                };
+                let available_frames =
+                    match super::with_manager(|manager| manager.available_frame_count()) {
+                        Ok(count) => count,
+                        Err(_) => return ptr::null_mut(),
+                    };
                 if available_frames < required_frames {
                     return ptr::null_mut();
                 }
@@ -272,13 +275,9 @@ fn grow(state: &mut HeapState, target_total_pages: usize) -> Result<(), HeapErro
                 .ok_or(HeapError::NoVirtualRange)?
                 .start_address(),
         };
-        let available_pages = available_pages_in_slot(base, already_mapped_pages)
-            .ok_or(HeapError::NoVirtualRange)?;
-        let pages = growth_chunk_pages(
-            target_total_pages,
-            already_mapped_pages,
-            available_pages,
-        );
+        let available_pages =
+            available_pages_in_slot(base, already_mapped_pages).ok_or(HeapError::NoVirtualRange)?;
+        let pages = growth_chunk_pages(target_total_pages, already_mapped_pages, available_pages);
         if pages == 0 {
             return Err(HeapError::NoVirtualRange);
         }
@@ -297,9 +296,7 @@ fn grow(state: &mut HeapState, target_total_pages: usize) -> Result<(), HeapErro
             match unsafe {
                 manager.allocate_and_map(
                     page,
-                    PageTableFlags::PRESENT
-                        | PageTableFlags::WRITABLE
-                        | PageTableFlags::NO_EXECUTE,
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
                 )
             } {
                 Ok(_) => mapped_pages += 1,
@@ -377,12 +374,18 @@ mod tests {
         let minimum = (minimum_bytes + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
         let aligned_bytes = minimum_bytes + overaligned.align() - 1;
         let target = (aligned_bytes + PAGE_SIZE as usize - 1) / PAGE_SIZE as usize;
-        assert_eq!(growth_pages_for_layout(overaligned), Some((minimum, target)));
+        assert_eq!(
+            growth_pages_for_layout(overaligned),
+            Some((minimum, target))
+        );
     }
 
     #[test_case]
     fn large_requests_grow_in_rollback_safe_chunks() {
-        assert_eq!(growth_chunk_pages(2048, 256, PML4_SLOT_PAGES), HEAP_GROWTH_PAGES);
+        assert_eq!(
+            growth_chunk_pages(2048, 256, PML4_SLOT_PAGES),
+            HEAP_GROWTH_PAGES
+        );
         assert_eq!(growth_chunk_pages(769, 768, PML4_SLOT_PAGES), 1);
         assert_eq!(growth_chunk_pages(100, 512, 17), 17);
         assert_eq!(growth_chunk_pages(100, 512, 0), 0);
@@ -397,7 +400,10 @@ mod tests {
         );
         assert_eq!(required_frames_for_growth(511, 1), Some(1));
         assert_eq!(required_frames_for_growth(512, 1), Some(2));
-        assert_eq!(required_frames_for_growth(PAGES_PER_PAGE_DIRECTORY, 1), Some(3));
+        assert_eq!(
+            required_frames_for_growth(PAGES_PER_PAGE_DIRECTORY, 1),
+            Some(3)
+        );
         assert_eq!(required_frames_for_growth(usize::MAX, 1), None);
     }
 
@@ -405,7 +411,10 @@ mod tests {
     fn growth_can_use_remaining_slot_space_without_crossing_into_another_slot() {
         let slot_start = VirtAddr::try_new(255 * PML4_SLOT_SIZE).unwrap();
         let slot_pages = (PML4_SLOT_SIZE / PAGE_SIZE) as usize;
-        assert_eq!(available_pages_in_slot(slot_start, slot_pages - 17), Some(17));
+        assert_eq!(
+            available_pages_in_slot(slot_start, slot_pages - 17),
+            Some(17)
+        );
         assert_eq!(available_pages_in_slot(slot_start, slot_pages), Some(0));
         assert_eq!(available_pages_in_slot(slot_start, slot_pages + 1), None);
     }

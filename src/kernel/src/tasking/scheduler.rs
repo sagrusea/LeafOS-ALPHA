@@ -1,7 +1,10 @@
+use crate::arch::user::{UserContext, UserContextError};
+use crate::memory::{self, AddressSpace};
 use crate::sync::Mutex;
 use alloc::boxed::Box;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use x86_64::VirtAddr;
 
 pub const MAX_TASKS: usize = 16;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
@@ -24,6 +27,14 @@ pub enum TaskState {
     Blocked,
     Sleeping,
     Terminated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskInfo {
+    pub id: TaskId,
+    pub state: TaskState,
+    pub is_idle: bool,
+    pub is_user: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,11 +68,19 @@ impl CpuContext {
 struct Task {
     id: TaskId,
     state: TaskState,
+    exit_code: Option<u64>,
     context: CpuContext,
     entry: Option<KernelTaskEntry>,
+    user: Option<UserTask>,
     _stack: Option<Box<[u64]>>,
+    stack_top: Option<VirtAddr>,
     wake_at: Option<u64>,
     is_idle: bool,
+}
+
+struct UserTask {
+    address_space: AddressSpace,
+    context: UserContext,
 }
 
 pub struct Scheduler {
@@ -82,7 +101,7 @@ impl Scheduler {
     }
 
     pub fn create_task(&mut self, context: CpuContext) -> Result<TaskId, SchedulerError> {
-        self.insert_task(context, None, None)
+        self.insert_task(context, None, None, None, None)
     }
 
     fn create_kernel_task(&mut self, entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
@@ -93,28 +112,43 @@ impl Scheduler {
             .checked_add(1)
             .ok_or(SchedulerError::TaskIdExhausted)?;
 
-        let mut stack =
-            vec![0u64; KERNEL_STACK_SIZE / core::mem::size_of::<u64>()].into_boxed_slice();
-        let stack_base = stack.as_mut_ptr() as usize;
-        let stack_top = stack_base
-            .checked_add(stack.len() * core::mem::size_of::<u64>())
-            .ok_or(SchedulerError::InvalidContext)?;
-        let aligned_top = stack_top & !0xf;
-        let initial_stack = aligned_top
-            .checked_sub(2 * core::mem::size_of::<u64>())
-            .ok_or(SchedulerError::InvalidContext)?;
-        let stack_index = initial_stack
-            .checked_sub(stack_base)
-            .filter(|offset| offset.is_multiple_of(core::mem::size_of::<u64>()))
-            .map(|offset| offset / core::mem::size_of::<u64>())
-            .filter(|index| *index < stack.len())
-            .ok_or(SchedulerError::InvalidContext)?;
-        stack[stack_index] = task_trampoline as *const () as usize as u64;
+        let (context, stack, stack_top) = create_task_stack()?;
+        self.insert_task(context, Some(entry), None, Some(stack), Some(stack_top))
+    }
 
-        let mut context = CpuContext::empty();
-        context.stack_pointer = initial_stack as u64;
-        context.rflags = 0x202;
-        self.insert_task(context, Some(entry), Some(stack))
+    fn create_user_task(
+        &mut self,
+        address_space: &mut Option<AddressSpace>,
+        context: UserContext,
+    ) -> Result<TaskId, SchedulerError> {
+        self.check_task_capacity()?;
+        let next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(SchedulerError::TaskIdExhausted)?;
+        let (cpu_context, stack, stack_top) = create_task_stack()?;
+        let address_space = address_space.take().ok_or(SchedulerError::InvalidContext)?;
+        let slot = self
+            .check_task_capacity()
+            .expect("reserved user task slot remains available");
+        let id = TaskId(self.next_id);
+        self.next_id = next_id;
+        self.tasks[slot] = Some(Task {
+            id,
+            state: TaskState::Ready,
+            exit_code: None,
+            context: cpu_context,
+            entry: None,
+            user: Some(UserTask {
+                address_space,
+                context,
+            }),
+            _stack: Some(stack),
+            stack_top: Some(stack_top),
+            wake_at: None,
+            is_idle: false,
+        });
+        Ok(id)
     }
 
     fn check_task_capacity(&self) -> Result<usize, SchedulerError> {
@@ -128,7 +162,9 @@ impl Scheduler {
         &mut self,
         context: CpuContext,
         entry: Option<KernelTaskEntry>,
+        user: Option<UserTask>,
         stack: Option<Box<[u64]>>,
+        stack_top: Option<VirtAddr>,
     ) -> Result<TaskId, SchedulerError> {
         let slot = self.check_task_capacity()?;
         let id = TaskId(self.next_id);
@@ -139,9 +175,12 @@ impl Scheduler {
         self.tasks[slot] = Some(Task {
             id,
             state: TaskState::Ready,
+            exit_code: None,
             context,
             entry,
+            user,
             _stack: stack,
+            stack_top,
             wake_at: None,
             is_idle: false,
         });
@@ -261,6 +300,14 @@ impl Scheduler {
         {
             return Err(SchedulerError::InvalidState);
         }
+        if let Some(user) = self.tasks[index]
+            .as_mut()
+            .and_then(|task| task.user.as_mut())
+        {
+            user.address_space
+                .destroy()
+                .map_err(|_| SchedulerError::AddressSpaceCleanup)?;
+        }
         self.tasks[index] = None;
         Ok(())
     }
@@ -276,6 +323,21 @@ impl Scheduler {
 
     pub fn task_context(&self, id: TaskId) -> Result<CpuContext, SchedulerError> {
         self.task(id).map(|task| task.context)
+    }
+
+    pub fn task_snapshot(&self) -> [Option<TaskInfo>; MAX_TASKS] {
+        let mut snapshot = [None; MAX_TASKS];
+        for (entry, task) in snapshot.iter_mut().zip(self.tasks.iter()) {
+            if let Some(task) = task {
+                *entry = Some(TaskInfo {
+                    id: task.id,
+                    state: task.state,
+                    is_idle: task.is_idle,
+                    is_user: task.user.is_some(),
+                });
+            }
+        }
+        snapshot
     }
 
     fn select_next(&mut self, start: usize) -> Result<TaskId, SchedulerError> {
@@ -327,11 +389,33 @@ pub enum SchedulerError {
     UnknownTask,
     InvalidState,
     InvalidContext,
+    InvalidUserContext(UserContextError),
+    AddressSpaceCleanup,
     TaskIdExhausted,
 }
 
 static GLOBAL_SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 static mut BOOTSTRAP_CONTEXT: CpuContext = CpuContext::empty();
+
+struct InterruptGuard {
+    restore_enabled: bool,
+}
+
+impl InterruptGuard {
+    fn new() -> Self {
+        let restore_enabled = x86_64::instructions::interrupts::are_enabled();
+        x86_64::instructions::interrupts::disable();
+        Self { restore_enabled }
+    }
+}
+
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        if self.restore_enabled {
+            x86_64::instructions::interrupts::enable();
+        }
+    }
+}
 
 core::arch::global_asm!(
     ".global leafos_context_switch",
@@ -363,6 +447,111 @@ unsafe extern "C" {
     fn leafos_context_switch(old: *mut CpuContext, new: *const CpuContext);
 }
 
+fn create_task_stack() -> Result<(CpuContext, Box<[u64]>, VirtAddr), SchedulerError> {
+    let mut stack = vec![0u64; KERNEL_STACK_SIZE / core::mem::size_of::<u64>()].into_boxed_slice();
+    let stack_base = stack.as_mut_ptr() as usize;
+    let stack_top = stack_base
+        .checked_add(stack.len() * core::mem::size_of::<u64>())
+        .ok_or(SchedulerError::InvalidContext)?;
+    let aligned_top = stack_top & !0xf;
+    let initial_stack = aligned_top
+        .checked_sub(2 * core::mem::size_of::<u64>())
+        .ok_or(SchedulerError::InvalidContext)?;
+    let stack_index = initial_stack
+        .checked_sub(stack_base)
+        .filter(|offset| offset.is_multiple_of(core::mem::size_of::<u64>()))
+        .map(|offset| offset / core::mem::size_of::<u64>())
+        .filter(|index| *index < stack.len())
+        .ok_or(SchedulerError::InvalidContext)?;
+    stack[stack_index] = task_trampoline as *const () as usize as u64;
+
+    let mut context = CpuContext::empty();
+    context.stack_pointer = initial_stack as u64;
+    context.rflags = 0x202;
+    Ok((context, stack, VirtAddr::new(aligned_top as u64)))
+}
+
+fn destroy_unspawned_address_space(
+    address_space: &mut Option<AddressSpace>,
+) -> Result<(), SchedulerError> {
+    if let Some(mut address_space) = address_space.take() {
+        address_space
+            .destroy()
+            .map_err(|_| SchedulerError::AddressSpaceCleanup)?;
+    }
+    Ok(())
+}
+
+fn activate_task_address_space(scheduler: &Scheduler, index: Option<usize>) {
+    let Some(index) = index else {
+        unsafe { memory::activate_kernel_address_space() }
+            .expect("restore kernel address space before bootstrap");
+        return;
+    };
+
+    let task = scheduler.tasks[index]
+        .as_ref()
+        .expect("selected task slot is empty");
+    if let Some(user) = task.user.as_ref() {
+        unsafe {
+            crate::arch::syscall::initialize(task.stack_top.expect("user task has no kernel stack"))
+        };
+        unsafe { user.address_space.activate() }.expect("activate selected user address space");
+    } else {
+        unsafe { memory::activate_kernel_address_space() }
+            .expect("activate kernel address space for kernel task");
+    }
+}
+
+/// Create a scheduled user task. Its address space is activated whenever the
+/// scheduler selects it and the boot address space is restored for kernel
+/// tasks and the bootstrap context.
+pub fn spawn_user(
+    address_space: AddressSpace,
+    entry: VirtAddr,
+    stack: VirtAddr,
+) -> Result<TaskId, SchedulerError> {
+    spawn_user_with_arguments(address_space, entry, stack, 0, VirtAddr::zero())
+}
+
+pub fn spawn_user_with_arguments(
+    address_space: AddressSpace,
+    entry: VirtAddr,
+    stack: VirtAddr,
+    argument_count: u64,
+    argument_vector: VirtAddr,
+) -> Result<TaskId, SchedulerError> {
+    let mut address_space = Some(address_space);
+    let context = match UserContext::for_address_space_with_arguments(
+        address_space.as_ref().expect("user address space missing"),
+        entry,
+        stack,
+        argument_count,
+        argument_vector,
+    ) {
+        Ok(context) => context,
+        Err(error) => {
+            destroy_unspawned_address_space(&mut address_space)?;
+            return Err(SchedulerError::InvalidUserContext(error));
+        }
+    };
+
+    let result = {
+        let mut scheduler = GLOBAL_SCHEDULER.lock();
+        if scheduler.idle_index.is_none()
+            && scheduler.tasks.iter().filter(|slot| slot.is_none()).count() <= 1
+        {
+            Err(SchedulerError::Full)
+        } else {
+            scheduler.create_user_task(&mut address_space, context)
+        }
+    };
+    if result.is_err() {
+        destroy_unspawned_address_space(&mut address_space)?;
+    }
+    result
+}
+
 pub fn spawn(entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
     spawn_into(&mut GLOBAL_SCHEDULER.lock(), entry)
 }
@@ -378,6 +567,7 @@ fn spawn_into(scheduler: &mut Scheduler, entry: KernelTaskEntry) -> Result<TaskI
 }
 
 pub fn run_tasks() -> Result<(), SchedulerError> {
+    let _interrupt_guard = InterruptGuard::new();
     let next_context = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         if scheduler.idle_index.is_none() {
@@ -395,6 +585,7 @@ pub fn run_tasks() -> Result<(), SchedulerError> {
         }
         scheduler.start()?;
         let index = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        activate_task_address_space(&scheduler, Some(index));
         &scheduler.tasks[index]
             .as_ref()
             .ok_or(SchedulerError::UnknownTask)?
@@ -422,11 +613,13 @@ pub fn run_tasks() -> Result<(), SchedulerError> {
 }
 
 pub fn yield_now() -> Result<(), SchedulerError> {
+    let _interrupt_guard = InterruptGuard::new();
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
         scheduler.transition_current(TaskState::Ready)?;
         let next = scheduler.current.ok_or(SchedulerError::NoRunnableTasks)?;
+        activate_task_address_space(&scheduler, Some(next));
         let old_context = &mut scheduler.tasks[current]
             .as_mut()
             .ok_or(SchedulerError::UnknownTask)?
@@ -447,6 +640,7 @@ pub fn yield_now() -> Result<(), SchedulerError> {
 /// interrupt frame remain on the interrupted task's stack. Switching from
 /// this call boundary suspends that entire frame until the task is resumed.
 pub(crate) fn preempt_from_timer() {
+    let _interrupt_guard = InterruptGuard::new();
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let Some(current) = scheduler.current else {
@@ -466,6 +660,7 @@ pub(crate) fn preempt_from_timer() {
             return;
         }
 
+        activate_task_address_space(&scheduler, Some(next));
         let old_context = &mut scheduler.tasks[current]
             .as_mut()
             .expect("interrupted task slot is empty")
@@ -484,6 +679,7 @@ pub(crate) fn preempt_from_timer() {
 /// when this task is later woken and scheduled again, this call resumes and
 /// returns `Ok(())`.
 pub fn block_now() -> Result<(), SchedulerError> {
+    let _interrupt_guard = InterruptGuard::new();
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
@@ -499,12 +695,16 @@ pub fn block_now() -> Result<(), SchedulerError> {
             .context as *mut CpuContext;
         let next_context = match scheduler.current {
             Some(next) => {
+                activate_task_address_space(&scheduler, Some(next));
                 &scheduler.tasks[next]
                     .as_ref()
                     .ok_or(SchedulerError::UnknownTask)?
                     .context as *const CpuContext
             }
-            None => &raw const BOOTSTRAP_CONTEXT,
+            None => {
+                activate_task_address_space(&scheduler, None);
+                &raw const BOOTSTRAP_CONTEXT
+            }
         };
         (old_context, next_context)
     };
@@ -518,6 +718,7 @@ pub fn sleep_ticks(duration: u64) -> Result<(), SchedulerError> {
     if duration == 0 {
         return Ok(());
     }
+    let _interrupt_guard = InterruptGuard::new();
     let deadline = crate::time::timer::ticks().wrapping_add(duration);
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
@@ -532,12 +733,16 @@ pub fn sleep_ticks(duration: u64) -> Result<(), SchedulerError> {
             .context as *mut CpuContext;
         let next_context = match scheduler.current {
             Some(next) => {
+                activate_task_address_space(&scheduler, Some(next));
                 &scheduler.tasks[next]
                     .as_ref()
                     .ok_or(SchedulerError::UnknownTask)?
                     .context as *const CpuContext
             }
-            None => &raw const BOOTSTRAP_CONTEXT,
+            None => {
+                activate_task_address_space(&scheduler, None);
+                &raw const BOOTSTRAP_CONTEXT
+            }
         };
         (old_context, next_context)
     };
@@ -558,6 +763,7 @@ fn idle_task_entry() {
                 assert!(idle.is_idle, "non-idle task entered idle loop");
                 idle.state = TaskState::Ready;
                 scheduler.current = None;
+                activate_task_address_space(&scheduler, None);
                 Some(
                     &mut scheduler.tasks[current]
                         .as_mut()
@@ -589,12 +795,80 @@ pub fn wake_task(id: TaskId) -> Result<(), SchedulerError> {
     GLOBAL_SCHEDULER.lock().wake(id)
 }
 
+/// Return whether the currently executing scheduled task is a user task.
+pub fn current_task_is_user() -> bool {
+    let scheduler = GLOBAL_SCHEDULER.lock();
+    scheduler
+        .current
+        .and_then(|index| scheduler.tasks[index].as_ref())
+        .is_some_and(|task| task.user.is_some())
+}
+
+/// Check a user buffer against the running task's address-space metadata.
+/// The scheduler lock keeps the task and its mappings stable during the check.
+pub fn validate_current_user_range(
+    address: u64,
+    length: usize,
+    writable: bool,
+) -> Result<(), memory::UserMemoryError> {
+    let scheduler = GLOBAL_SCHEDULER.lock();
+    let task = scheduler
+        .current
+        .and_then(|index| scheduler.tasks[index].as_ref())
+        .and_then(|task| task.user.as_ref())
+        .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
+    task.address_space
+        .validate_user_range(address, length, writable)
+}
+
+/// Copy a bounded syscall argument out of the currently running user task.
+pub fn copy_from_current_user(
+    address: u64,
+    output: &mut [u8],
+) -> Result<(), memory::UserMemoryError> {
+    let scheduler = GLOBAL_SCHEDULER.lock();
+    let task = scheduler
+        .current
+        .and_then(|index| scheduler.tasks[index].as_ref())
+        .and_then(|task| task.user.as_ref())
+        .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
+    task.address_space.copy_from_user(address, output)
+}
+
+/// Copy syscall output to a writable buffer in the currently running task.
+pub fn copy_to_current_user(
+    address: u64,
+    input: &[u8],
+) -> Result<(), memory::UserMemoryError> {
+    let scheduler = GLOBAL_SCHEDULER.lock();
+    let task = scheduler
+        .current
+        .and_then(|index| scheduler.tasks[index].as_ref())
+        .and_then(|task| task.user.as_ref())
+        .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
+    task.address_space.copy_to_user(address, input)
+}
+
 /// Terminate the current kernel task without returning to its entry function.
 /// The terminated task can be released later with `reap_terminated()`.
 pub fn exit_current() -> ! {
+    exit_current_with_status(None)
+}
+
+/// Terminate the current task and retain its user-visible exit code until reaped.
+pub fn exit_current_with_code(exit_code: u64) -> ! {
+    exit_current_with_status(Some(exit_code))
+}
+
+fn exit_current_with_status(exit_code: Option<u64>) -> ! {
+    let _interrupt_guard = InterruptGuard::new();
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.expect("task exit without current task");
+        scheduler.tasks[current]
+            .as_mut()
+            .expect("current task slot is empty")
+            .exit_code = exit_code;
 
         match scheduler.transition_current(TaskState::Terminated) {
             Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
@@ -607,12 +881,16 @@ pub fn exit_current() -> ! {
             .context as *mut CpuContext;
         let next_context = match scheduler.current {
             Some(next) => {
+                activate_task_address_space(&scheduler, Some(next));
                 &scheduler.tasks[next]
                     .as_ref()
                     .expect("selected task slot is empty")
                     .context as *const CpuContext
             }
-            None => &raw const BOOTSTRAP_CONTEXT,
+            None => {
+                activate_task_address_space(&scheduler, None);
+                &raw const BOOTSTRAP_CONTEXT
+            }
         };
         (old_context, next_context)
     };
@@ -624,21 +902,39 @@ pub fn task_state(id: TaskId) -> Result<TaskState, SchedulerError> {
     GLOBAL_SCHEDULER.lock().task_state(id)
 }
 
+/// Return a terminated task's exit code, or `None` if it failed or was a kernel task.
+pub fn task_exit_code(id: TaskId) -> Result<Option<u64>, SchedulerError> {
+    GLOBAL_SCHEDULER.lock().task(id).map(|task| task.exit_code)
+}
+
+pub fn task_snapshot() -> [Option<TaskInfo>; MAX_TASKS] {
+    GLOBAL_SCHEDULER.lock().task_snapshot()
+}
+
 pub fn reap_terminated(id: TaskId) -> Result<(), SchedulerError> {
     GLOBAL_SCHEDULER.lock().reap_terminated(id)
 }
 
 extern "C" fn task_trampoline() -> ! {
-    let entry = {
+    let (entry, user_context, stack_top) = {
         let scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler
             .current
             .expect("task trampoline without current task");
-        scheduler.tasks[current]
+        let task = scheduler.tasks[current]
             .as_ref()
-            .and_then(|task| task.entry)
-            .expect("kernel task missing entry")
+            .expect("current task slot is empty");
+        (
+            task.entry,
+            task.user.as_ref().map(|user| user.context),
+            task.stack_top,
+        )
     };
+    if let Some(context) = user_context {
+        assert!(stack_top.is_some(), "user task has no kernel stack");
+        unsafe { crate::arch::user::enter(context) }
+    }
+    let entry = entry.expect("kernel task missing entry");
     entry();
     exit_current()
 }
@@ -681,6 +977,39 @@ fn scheduler_rotates_ready_tasks_in_round_robin_order() {
     assert_eq!(scheduler.yield_current(), Ok(first));
     assert_eq!(scheduler.task_state(first), Ok(TaskState::Running));
     assert_eq!(scheduler.task_state(second), Ok(TaskState::Ready));
+}
+
+#[test_case]
+fn scheduler_task_snapshot_reports_current_states() {
+    let mut scheduler = Scheduler::new();
+    let first = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create first task");
+    let second = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create second task");
+    assert_eq!(scheduler.start(), Ok(first));
+
+    let snapshot = scheduler.task_snapshot();
+    assert_eq!(
+        snapshot[0],
+        Some(TaskInfo {
+            id: first,
+            state: TaskState::Running,
+            is_idle: false,
+            is_user: false,
+        })
+    );
+    assert_eq!(
+        snapshot[1],
+        Some(TaskInfo {
+            id: second,
+            state: TaskState::Ready,
+            is_idle: false,
+            is_user: false,
+        })
+    );
+    assert!(snapshot[2..].iter().all(Option::is_none));
 }
 
 #[test_case]
@@ -1016,7 +1345,6 @@ fn scheduler_allows_task_creation_while_another_task_is_running() {
     assert_scheduler_invariants(&scheduler);
 }
 
-
 static SLEEP_TEST_STARTED: AtomicBool = AtomicBool::new(false);
 static SLEEP_TEST_OTHER_RAN: AtomicBool = AtomicBool::new(false);
 static SLEEP_TEST_FINISHED: AtomicBool = AtomicBool::new(false);
@@ -1088,13 +1416,11 @@ fn scheduler_sleep_ticks_switches_tasks_and_resumes_after_deadline() {
     SLEEP_TEST_START_TICK.store(0, Ordering::SeqCst);
     SLEEP_TEST_RESUME_TICK.store(0, Ordering::SeqCst);
 
-    let sleeper =
-        spawn(sleep_ticks_test_sleeper).expect("spawn sleeping task");
+    let sleeper = spawn(sleep_ticks_test_sleeper).expect("spawn sleeping task");
 
     SLEEP_TEST_TASK_ID.store(sleeper.get(), Ordering::SeqCst);
 
-    let other =
-        spawn(sleep_ticks_test_other_task).expect("spawn second task");
+    let other = spawn(sleep_ticks_test_other_task).expect("spawn second task");
 
     SLEEP_TEST_OTHER_TASK_ID.store(other.get(), Ordering::SeqCst);
 

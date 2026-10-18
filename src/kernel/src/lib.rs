@@ -21,6 +21,7 @@ pub mod shell;
 pub mod sync;
 pub mod tasking;
 pub mod time;
+pub mod user_program;
 
 pub use arch::{gdt, interrupts};
 pub use console::{framebuffer, serial, vga_buffer};

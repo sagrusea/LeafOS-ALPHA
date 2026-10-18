@@ -13,6 +13,7 @@ use x86_64::{
 };
 
 use crate::boot_info::BootInfo;
+use alloc::vec::Vec;
 
 pub mod heap;
 
@@ -25,6 +26,9 @@ const RECLAIMED_FRAME_CAPACITY: usize = 260;
 const MAX_FRAMES_RECLAIMED_PER_UNMAP: usize = 4;
 const EFI_MEMORY_MAP_VERSION: u32 = 2;
 const EFI_MEMORY_DESCRIPTOR_VERSION: u32 = 1;
+pub const USER_PML4_INDEX: usize = 255;
+pub const USER_SPACE_START: u64 = (USER_PML4_INDEX as u64) << 39;
+pub const USER_SPACE_END: u64 = USER_SPACE_START + (1 << 39);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryError {
@@ -37,11 +41,14 @@ pub enum MemoryError {
     PhysicalAddressOutOfRange,
     FrameReclaimCapacityExceeded,
     NotInitialized,
+    FrameAllocationFailed,
+    NoUserAddressSpaceSlot,
 }
 
 #[derive(Debug)]
 pub enum MappingError {
     PhysicalAddressOutOfRange,
+    InvalidPageTableRoot,
     Mapper(MapToError<Size4KiB>),
 }
 
@@ -51,6 +58,221 @@ pub enum UnmappingError {
     FrameNotAllocatorOwned,
     ReclaimCapacityExceeded,
     Mapper(UnmapError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserPageAccess {
+    ReadOnly,
+    ReadWrite,
+    ReadExecute,
+}
+
+#[derive(Debug)]
+pub enum AddressSpaceError {
+    Memory(MemoryError),
+    Mapping(MappingError),
+    Unmapping(UnmappingError),
+    InvalidUserPage,
+    DuplicateUserPage,
+    UserPageNotMapped,
+    AllocationFailed,
+    Released,
+    ActiveAddressSpace,
+}
+
+/// Failure while validating or copying a range supplied by user mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserMemoryError {
+    InvalidAddress,
+    Unmapped,
+    NotWritable,
+    InactiveAddressSpace,
+}
+
+pub struct AddressSpace {
+    root: Option<PhysFrame<Size4KiB>>,
+    user_pages: Vec<(Page<Size4KiB>, UserPageAccess)>,
+}
+
+impl AddressSpace {
+    pub fn root_physical_address(&self) -> Option<PhysAddr> {
+        self.root.map(|root| root.start_address())
+    }
+
+    pub fn contains_user_address(address: VirtAddr) -> bool {
+        (USER_SPACE_START..USER_SPACE_END).contains(&address.as_u64())
+    }
+
+    pub fn map_user_page(
+        &mut self,
+        page: Page<Size4KiB>,
+        access: UserPageAccess,
+    ) -> Result<PhysAddr, AddressSpaceError> {
+        let root = self.root.ok_or(AddressSpaceError::Released)?;
+        if usize::from(page.p4_index()) != USER_PML4_INDEX {
+            return Err(AddressSpaceError::InvalidUserPage);
+        }
+        if self.user_pages.iter().any(|(mapped, _)| *mapped == page) {
+            return Err(AddressSpaceError::DuplicateUserPage);
+        }
+        self.user_pages
+            .try_reserve(1)
+            .map_err(|_| AddressSpaceError::AllocationFailed)?;
+
+        let frame = with_manager(|manager| manager.map_user_page(root, page, access))
+            .map_err(AddressSpaceError::Memory)?
+            .map_err(AddressSpaceError::Mapping)?;
+        self.user_pages.push((page, access));
+        Ok(frame.start_address())
+    }
+
+    pub fn unmap_user_page(&mut self, page: Page<Size4KiB>) -> Result<(), AddressSpaceError> {
+        let root = self.root.ok_or(AddressSpaceError::Released)?;
+        let index = self
+            .user_pages
+            .iter()
+            .position(|(mapped, _)| *mapped == page)
+            .ok_or(AddressSpaceError::UserPageNotMapped)?;
+        with_manager(|manager| manager.unmap_page(root, page))
+            .map_err(AddressSpaceError::Memory)?
+            .map_err(AddressSpaceError::Unmapping)?;
+        self.user_pages.remove(index);
+        Ok(())
+    }
+
+    pub fn user_page_access(&self, page: Page<Size4KiB>) -> Option<UserPageAccess> {
+        self.user_pages
+            .iter()
+            .find_map(|(mapped, access)| (*mapped == page).then_some(*access))
+    }
+
+    /// Check an entire user buffer before touching it. `length == 0` is
+    /// intentionally accepted without inspecting `address`, as no memory is
+    /// accessed for an empty operation.
+    pub fn validate_user_range(
+        &self,
+        address: u64,
+        length: usize,
+        writable: bool,
+    ) -> Result<(), UserMemoryError> {
+        if length == 0 {
+            return Ok(());
+        }
+
+        let start = VirtAddr::try_new(address)
+            .map_err(|_| UserMemoryError::InvalidAddress)?
+            .as_u64();
+        let length = u64::try_from(length).map_err(|_| UserMemoryError::InvalidAddress)?;
+        let end = start
+            .checked_add(length)
+            .ok_or(UserMemoryError::InvalidAddress)?;
+        if start < USER_SPACE_START || end > USER_SPACE_END || end <= start {
+            return Err(UserMemoryError::InvalidAddress);
+        }
+
+        // Do not accept a buffer merely because its first byte is mapped.
+        // Syscall buffers can cross pages, each of which must have the needed
+        // access permissions in this process's page map.
+        let mut page_address = start & !PAGE_MASK;
+        while page_address < end {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(page_address));
+            let access = self
+                .user_page_access(page)
+                .ok_or(UserMemoryError::Unmapped)?;
+            if writable && access != UserPageAccess::ReadWrite {
+                return Err(UserMemoryError::NotWritable);
+            }
+            page_address = page_address
+                .checked_add(PAGE_SIZE)
+                .ok_or(UserMemoryError::InvalidAddress)?;
+        }
+
+        // Copying via a user virtual address is only safe for the currently
+        // active address space. This also prevents a caller from validating
+        // one process's metadata and accidentally reading another process's
+        // mappings at the same virtual address.
+        if self.root != Some(Cr3::read().0) {
+            return Err(UserMemoryError::InactiveAddressSpace);
+        }
+
+        Ok(())
+    }
+
+    /// Copy from a validated, readable buffer in this active process.
+    pub fn copy_from_user(
+        &self,
+        address: u64,
+        output: &mut [u8],
+    ) -> Result<(), UserMemoryError> {
+        self.validate_user_range(address, output.len(), false)?;
+        if output.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the whole range was checked against this active address
+        // space's mapped user pages above, and the kernel output slice is
+        // valid and does not overlap user virtual memory.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                VirtAddr::new(address).as_ptr::<u8>(),
+                output.as_mut_ptr(),
+                output.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Copy into a validated, writable buffer in this active process.
+    pub fn copy_to_user(
+        &self,
+        address: u64,
+        input: &[u8],
+    ) -> Result<(), UserMemoryError> {
+        self.validate_user_range(address, input.len(), true)?;
+        if input.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: the whole destination range was checked against this active
+        // address space and every covered page is marked read/write.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                input.as_ptr(),
+                VirtAddr::new(address).as_mut_ptr::<u8>(),
+                input.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure interrupts are disabled while switching address
+    /// spaces and that all kernel mappings used by the caller are shared.
+    pub unsafe fn activate(&self) -> Result<(), AddressSpaceError> {
+        let root = self.root.ok_or(AddressSpaceError::Released)?;
+        if Cr3::read().0 != root {
+            unsafe { Cr3::write(root, x86_64::registers::control::Cr3Flags::empty()) };
+        }
+        Ok(())
+    }
+
+    pub fn destroy(&mut self) -> Result<(), AddressSpaceError> {
+        let root = self.root.ok_or(AddressSpaceError::Released)?;
+        if Cr3::read().0 == root {
+            return Err(AddressSpaceError::ActiveAddressSpace);
+        }
+        while let Some((page, _)) = self.user_pages.last().copied() {
+            with_manager(|manager| manager.unmap_page(root, page))
+                .map_err(AddressSpaceError::Memory)?
+                .map_err(AddressSpaceError::Unmapping)?;
+            self.user_pages.pop();
+        }
+
+        with_manager(|manager| unsafe { manager.deallocate_frame(root) })
+            .map_err(AddressSpaceError::Memory)?
+            .map_err(AddressSpaceError::Memory)?;
+        self.root = None;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -438,11 +660,20 @@ pub struct MemoryManager<'a> {
     mapper: OffsetPageTable<'static>,
     frame_allocator: BootInfoFrameAllocator<'a>,
     physical_limit: u64,
+    kernel_root: PhysFrame<Size4KiB>,
 }
 
 static MEMORY_MANAGER: Once<Result<Mutex<MemoryManager<'static>>, MemoryError>> = Once::new();
 
 impl MemoryManager<'_> {
+    fn physical_to_virtual(&self, frame: PhysFrame<Size4KiB>) -> Option<VirtAddr> {
+        self.mapper
+            .phys_offset()
+            .as_u64()
+            .checked_add(frame.start_address().as_u64())
+            .and_then(|address| VirtAddr::try_new(address).ok())
+    }
+
     pub fn translate_addr(&self, address: VirtAddr) -> Option<PhysAddr> {
         self.mapper.translate_addr(address)
     }
@@ -491,8 +722,154 @@ impl MemoryManager<'_> {
             // of allocator-owned virtual memory.
             .take(256)
             .skip(1)
+            .filter(|(index, _)| *index != USER_PML4_INDEX)
             .find(|(_, entry)| entry.is_unused())
             .map(|(index, _)| Page::containing_address(VirtAddr::new((index as u64) << 39)))
+    }
+
+    fn create_address_space(&mut self) -> Result<AddressSpace, MemoryError> {
+        let kernel_table = self.mapper.level_4_table();
+        if !kernel_table[USER_PML4_INDEX].is_unused() {
+            return Err(MemoryError::NoUserAddressSpaceSlot);
+        }
+        let root = self
+            .frame_allocator
+            .allocate_frame()
+            .ok_or(MemoryError::FrameAllocationFailed)?;
+        let Some(root_virtual) = self.physical_to_virtual(root) else {
+            assert!(self.frame_allocator.reclaim_frame(root));
+            return Err(MemoryError::InvalidPhysicalMemoryOffset);
+        };
+        let root_table = root_virtual.as_mut_ptr::<PageTable>();
+        unsafe { root_table.write(PageTable::new()) };
+        for index in 0..512 {
+            if index == USER_PML4_INDEX {
+                continue;
+            }
+            let entry = &kernel_table[index];
+            if !entry.is_unused() {
+                unsafe {
+                    (&mut *root_table)[index].set_addr(
+                        entry.addr(),
+                        entry.flags() & !PageTableFlags::USER_ACCESSIBLE,
+                    );
+                }
+            }
+        }
+        Ok(AddressSpace {
+            root: Some(root),
+            user_pages: Vec::new(),
+        })
+    }
+
+    fn root_mapper(
+        &self,
+        root: PhysFrame<Size4KiB>,
+    ) -> Result<OffsetPageTable<'static>, MemoryError> {
+        let root_virtual = self
+            .physical_to_virtual(root)
+            .ok_or(MemoryError::InvalidPhysicalMemoryOffset)?;
+        let table = unsafe { &mut *root_virtual.as_mut_ptr::<PageTable>() };
+        Ok(unsafe { OffsetPageTable::new(table, self.mapper.phys_offset()) })
+    }
+
+    fn map_user_page(
+        &mut self,
+        root: PhysFrame<Size4KiB>,
+        page: Page<Size4KiB>,
+        access: UserPageAccess,
+    ) -> Result<PhysFrame<Size4KiB>, MappingError> {
+        let frame = self
+            .frame_allocator
+            .allocate_frame()
+            .ok_or(MappingError::Mapper(MapToError::FrameAllocationFailed))?;
+        let Some(frame_virtual) = self.physical_to_virtual(frame) else {
+            assert!(self.frame_allocator.reclaim_frame(frame));
+            return Err(MappingError::PhysicalAddressOutOfRange);
+        };
+        unsafe {
+            frame_virtual
+                .as_mut_ptr::<u8>()
+                .write_bytes(0, PAGE_SIZE as usize)
+        };
+        let flags = match access {
+            UserPageAccess::ReadOnly => {
+                PageTableFlags::PRESENT
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE
+            }
+            UserPageAccess::ReadWrite => {
+                PageTableFlags::PRESENT
+                    | PageTableFlags::WRITABLE
+                    | PageTableFlags::USER_ACCESSIBLE
+                    | PageTableFlags::NO_EXECUTE
+            }
+            UserPageAccess::ReadExecute => {
+                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE
+            }
+        };
+        let mut mapper = match self.root_mapper(root) {
+            Ok(mapper) => mapper,
+            Err(_) => {
+                assert!(self.frame_allocator.reclaim_frame(frame));
+                return Err(MappingError::InvalidPageTableRoot);
+            }
+        };
+        match unsafe { mapper.map_to(page, frame, flags, &mut self.frame_allocator) } {
+            Ok(flush) => {
+                flush.flush();
+                Ok(frame)
+            }
+            Err(error) => {
+                unsafe {
+                    mapper.clean_up_addr_range(
+                        PageRangeInclusive {
+                            start: page,
+                            end: page,
+                        },
+                        &mut self.frame_allocator,
+                    );
+                }
+                assert!(self.frame_allocator.reclaim_frame(frame));
+                Err(MappingError::Mapper(error))
+            }
+        }
+    }
+
+    fn unmap_page(
+        &mut self,
+        root: PhysFrame<Size4KiB>,
+        page: Page<Size4KiB>,
+    ) -> Result<(), UnmappingError> {
+        if self.frame_allocator.reclaimed_count
+            > RECLAIMED_FRAME_CAPACITY - MAX_FRAMES_RECLAIMED_PER_UNMAP
+        {
+            return Err(UnmappingError::ReclaimCapacityExceeded);
+        }
+        let mut mapper = self
+            .root_mapper(root)
+            .map_err(|_| UnmappingError::PageNotMapped)?;
+        let mapped_address = mapper
+            .translate_addr(page.start_address())
+            .ok_or(UnmappingError::PageNotMapped)?;
+        let frame = PhysFrame::containing_address(mapped_address);
+        if !self.frame_allocator.is_allocatable_frame(frame) {
+            return Err(UnmappingError::FrameNotAllocatorOwned);
+        }
+        let (unmapped_frame, flush) = mapper.unmap(page).map_err(UnmappingError::Mapper)?;
+        assert_eq!(unmapped_frame, frame, "mapping changed during unmap");
+        flush.flush();
+        assert!(self.frame_allocator.reclaim_frame(frame));
+        unsafe {
+            mapper.clean_up_addr_range(
+                PageRangeInclusive {
+                    start: page,
+                    end: page,
+                },
+                &mut self.frame_allocator,
+            );
+        }
+        Ok(())
     }
 
     /// Maps a caller-owned frame and invalidates this CPU's translation.
@@ -704,6 +1081,7 @@ unsafe fn create<'a>(
         mapper,
         frame_allocator,
         physical_limit,
+        kernel_root: active_root,
     })
 }
 
@@ -736,6 +1114,26 @@ pub fn with_manager<R>(
         let mut manager = manager.lock();
         operation(&mut manager)
     }))
+}
+
+pub fn create_address_space() -> Result<AddressSpace, AddressSpaceError> {
+    with_manager(MemoryManager::create_address_space)
+        .map_err(AddressSpaceError::Memory)?
+        .map_err(AddressSpaceError::Memory)
+}
+
+/// Restore the address space installed by the bootloader.
+///
+/// # Safety
+///
+/// Call only when executing on a stack and code mapped by the boot address
+/// space, with interrupts disabled during the CR3 transition.
+pub unsafe fn activate_kernel_address_space() -> Result<(), MemoryError> {
+    let root = with_manager(|manager| manager.kernel_root).map_err(|error| error)?;
+    if Cr3::read().0 != root {
+        unsafe { Cr3::write(root, x86_64::registers::control::Cr3Flags::empty()) };
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -884,7 +1282,11 @@ mod tests {
         const ROUNDS: usize = 100;
 
         let (bytes, length) = map_bytes(
-            &[descriptor(EFI_CONVENTIONAL_MEMORY, 0x1000, FRAME_COUNT as u64)],
+            &[descriptor(
+                EFI_CONVENTIONAL_MEMORY,
+                0x1000,
+                FRAME_COUNT as u64,
+            )],
             EFI_DESCRIPTOR_MIN_SIZE,
         );
         let mut allocator = BootInfoFrameAllocator {

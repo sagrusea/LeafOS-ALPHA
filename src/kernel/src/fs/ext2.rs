@@ -2,6 +2,9 @@ use crate::sync::Mutex;
 use crate::sync::Once;
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
+#[cfg(feature = "test-hooks")]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::drivers::ata::{self, AtaError};
 
@@ -26,6 +29,9 @@ pub enum Ext2Error {
     AlreadyExists,
     NotEmpty,
     NoSpace,
+    AllocationFailed,
+    FileTooLarge,
+    RecoveryFailed,
     UnsupportedFeature,
     NotInitialized,
 }
@@ -48,6 +54,7 @@ struct Inode {
     mode: u16,
     links: u16,
     size: u64,
+    allocated_blocks_512: u32,
     blocks: [u32; DIRECT_BLOCKS],
     single_indirect: u32,
     double_indirect: u32,
@@ -55,6 +62,48 @@ struct Inode {
 
 static EXT2: Once<Result<Metadata, Ext2Error>> = Once::new();
 static EXT2_WRITE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(feature = "test-hooks")]
+static WRITE_FAILURE_AFTER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+struct BlockTransaction {
+    undo: Vec<(u32, Box<[u8]>)>,
+}
+
+impl BlockTransaction {
+    fn new() -> Self {
+        Self { undo: Vec::new() }
+    }
+
+    fn write(&mut self, metadata: Metadata, block: u32, contents: &[u8]) -> Result<(), Ext2Error> {
+        if !self
+            .undo
+            .iter()
+            .any(|(saved_block, _)| *saved_block == block)
+        {
+            self.undo
+                .try_reserve(1)
+                .map_err(|_| Ext2Error::AllocationFailed)?;
+            let mut original = zeroed_block();
+            read_block(metadata, block, &mut original)?;
+            self.undo.push((block, original));
+        }
+        write_block(metadata, block, contents)
+    }
+
+    fn rollback(self, metadata: Metadata) -> Result<(), Ext2Error> {
+        let mut failed = false;
+        for (block, contents) in self.undo.into_iter().rev() {
+            if write_block(metadata, block, &contents).is_err() {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(Ext2Error::RecoveryFailed)
+        } else {
+            Ok(())
+        }
+    }
+}
 
 fn zeroed_block() -> Box<[u8]> {
     vec![0; 4096].into_boxed_slice()
@@ -93,12 +142,44 @@ fn write_block(metadata: Metadata, block: u32, input: &[u8]) -> Result<(), Ext2E
     if block >= metadata.blocks_count || input.len() < metadata.block_size {
         return Err(Ext2Error::InvalidFilesystem);
     }
+    #[cfg(feature = "test-hooks")]
+    if fail_test_write() {
+        return Err(Ext2Error::Disk(AtaError::Device));
+    }
     let length = metadata.block_size;
     let sectors = disk_block_size(length)?;
     let lba = block
         .checked_mul(u32::from(sectors))
         .ok_or(Ext2Error::InvalidFilesystem)?;
     ata::write_sectors(lba, sectors, &input[..length]).map_err(Ext2Error::Disk)
+}
+
+#[cfg(feature = "test-hooks")]
+fn fail_test_write() -> bool {
+    let mut remaining = WRITE_FAILURE_AFTER.load(Ordering::Relaxed);
+    while remaining != usize::MAX {
+        let next = if remaining == 0 {
+            usize::MAX
+        } else {
+            remaining - 1
+        };
+        match WRITE_FAILURE_AFTER.compare_exchange_weak(
+            remaining,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return remaining == 0,
+            Err(current) => remaining = current,
+        }
+    }
+    false
+}
+
+#[cfg(feature = "test-hooks")]
+/// Inject one block-write failure after the requested successful writes.
+pub fn fail_next_write_after(successful_writes: usize) {
+    WRITE_FAILURE_AFTER.store(successful_writes, Ordering::Relaxed);
 }
 
 fn mount() -> Result<Metadata, Ext2Error> {
@@ -325,6 +406,7 @@ fn read_inode(metadata: Metadata, inode_number: u32) -> Result<Inode, Ext2Error>
         mode: le16(raw, 0),
         links: le16(raw, 26),
         size,
+        allocated_blocks_512: le32(raw, 28),
         blocks,
         single_indirect,
         double_indirect,
@@ -501,7 +583,11 @@ fn write_inode_fields(
     size: u32,
     link_count: u16,
     data_blocks: &[u32; DIRECT_BLOCKS],
+    single_indirect: u32,
+    double_indirect: u32,
+    allocated_blocks_512: u32,
     is_new: bool,
+    transaction: Option<&mut BlockTransaction>,
 ) -> Result<(), Ext2Error> {
     let inode_index = inode_number
         .checked_sub(1)
@@ -535,20 +621,49 @@ fn write_inode_fields(
     if metadata.inode_size >= 112 {
         inode[108..112].fill(0);
     }
-    let sectors_per_block =
-        u32::try_from(metadata.block_size / 512).map_err(|_| Ext2Error::InvalidFilesystem)?;
-    let allocated_blocks = u32::try_from(data_blocks.iter().filter(|block| **block != 0).count())
-        .map_err(|_| Ext2Error::InvalidFilesystem)?;
-    inode[28..32].copy_from_slice(&(allocated_blocks * sectors_per_block).to_le_bytes());
+    inode[28..32].copy_from_slice(&allocated_blocks_512.to_le_bytes());
     for (index, block) in data_blocks.iter().enumerate() {
         let offset = INODE_BLOCK_POINTERS_OFFSET + index * 4;
         inode[offset..offset + 4].copy_from_slice(&block.to_le_bytes());
     }
-    write_block(metadata, block_number, &block)
+    let single_offset = INODE_BLOCK_POINTERS_OFFSET + DIRECT_BLOCKS * 4;
+    inode[single_offset..single_offset + 4].copy_from_slice(&single_indirect.to_le_bytes());
+    inode[single_offset + 4..single_offset + 8].copy_from_slice(&double_indirect.to_le_bytes());
+    match transaction {
+        Some(transaction) => transaction.write(metadata, block_number, &block),
+        None => write_block(metadata, block_number, &block),
+    }
 }
 
 fn find_free_bit(bitmap: &[u8], count: u32) -> Option<u32> {
     (0..count).find(|index| bitmap[*index as usize / 8] & (1 << (*index % 8)) == 0)
+}
+
+fn allocate_data_block(metadata: Metadata, bitmap: &mut [u8]) -> Result<u32, Ext2Error> {
+    let block_index = find_free_bit(bitmap, metadata.blocks_count - metadata.first_data_block)
+        .ok_or(Ext2Error::NoSpace)?;
+    let block = block_index
+        .checked_add(metadata.first_data_block)
+        .ok_or(Ext2Error::InvalidFilesystem)?;
+    update_block_bitmap(metadata, bitmap, block, true)?;
+    Ok(block)
+}
+
+fn single_indirect_capacity(metadata: Metadata) -> Result<usize, Ext2Error> {
+    DIRECT_BLOCKS
+        .checked_add(metadata.block_size / 4)
+        .ok_or(Ext2Error::UnsupportedFeature)
+}
+
+fn double_indirect_capacity(metadata: Metadata) -> Result<usize, Ext2Error> {
+    let pointers_per_block = metadata.block_size / 4;
+    single_indirect_capacity(metadata)?
+        .checked_add(
+            pointers_per_block
+                .checked_mul(pointers_per_block)
+                .ok_or(Ext2Error::UnsupportedFeature)?,
+        )
+        .ok_or(Ext2Error::UnsupportedFeature)
 }
 
 fn add_directory_entry(
@@ -557,6 +672,7 @@ fn add_directory_entry(
     name: &[u8],
     inode_number: u32,
     file_type: u8,
+    transaction: Option<&mut BlockTransaction>,
 ) -> Result<(), Ext2Error> {
     if directory.mode & 0xf000 != 0x4000 || inode_block_count(metadata, directory)? != 1 {
         return Err(Ext2Error::UnsupportedFeature);
@@ -615,7 +731,10 @@ fn add_directory_entry(
                     .copy_from_slice(&(name.len() as u16).to_le_bytes());
             }
             block[entry_offset + 8..entry_offset + 8 + name.len()].copy_from_slice(name);
-            return write_block(metadata, block_number, &block);
+            return match transaction {
+                Some(transaction) => transaction.write(metadata, block_number, &block),
+                None => write_block(metadata, block_number, &block),
+            };
         }
         offset += record_len;
     }
@@ -817,7 +936,11 @@ fn update_free_counters(
     descriptor: &mut [u8],
     blocks_delta: i32,
     inodes_delta: i32,
+    transaction: Option<&mut BlockTransaction>,
 ) -> Result<(), Ext2Error> {
+    if blocks_delta == 0 && inodes_delta == 0 {
+        return Ok(());
+    }
     let descriptor_blocks = i32::from(le16(descriptor, 12))
         .checked_add(blocks_delta)
         .filter(|count| (0..=u16::MAX as i32).contains(count))
@@ -841,8 +964,141 @@ fn update_free_counters(
     descriptor[14..16].copy_from_slice(&descriptor_inodes.to_le_bytes());
     superblock[12..16].copy_from_slice(&super_blocks.to_le_bytes());
     superblock[16..20].copy_from_slice(&super_inodes.to_le_bytes());
-    write_block(metadata, metadata.first_data_block + 1, descriptor)?;
-    write_block(metadata, metadata.first_data_block, &superblock)
+    match transaction {
+        Some(transaction) => {
+            transaction.write(metadata, metadata.first_data_block + 1, descriptor)?;
+            transaction.write(metadata, metadata.first_data_block, &superblock)
+        }
+        None => {
+            write_block(metadata, metadata.first_data_block + 1, descriptor)?;
+            write_block(metadata, metadata.first_data_block, &superblock)
+        }
+    }
+}
+
+fn free_data_blocks(
+    metadata: Metadata,
+    blocks: &[u32],
+    transaction: Option<&mut BlockTransaction>,
+) -> Result<(), Ext2Error> {
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    let (block_bitmap_number, _, mut descriptor, mut block_bitmap, _) =
+        read_allocation_tables(metadata)?;
+    for &block in blocks {
+        update_block_bitmap(metadata, &mut block_bitmap, block, false)?;
+    }
+    match transaction {
+        Some(transaction) => {
+            transaction.write(metadata, block_bitmap_number, &block_bitmap)?;
+            update_free_counters(
+                metadata,
+                &mut descriptor,
+                i32::try_from(blocks.len()).map_err(|_| Ext2Error::InvalidFilesystem)?,
+                0,
+                Some(transaction),
+            )
+        }
+        None => {
+            write_block(metadata, block_bitmap_number, &block_bitmap)?;
+            update_free_counters(
+                metadata,
+                &mut descriptor,
+                i32::try_from(blocks.len()).map_err(|_| Ext2Error::InvalidFilesystem)?,
+                0,
+                None,
+            )
+        }
+    }
+}
+
+fn push_unique_block(blocks: &mut Vec<u32>, block: u32) -> Result<(), Ext2Error> {
+    if blocks.contains(&block) {
+        return Err(Ext2Error::InvalidFilesystem);
+    }
+    blocks.push(block);
+    Ok(())
+}
+
+fn collect_file_allocations(metadata: Metadata, inode: Inode) -> Result<Vec<u32>, Ext2Error> {
+    if inode.size > (double_indirect_capacity(metadata)? * metadata.block_size) as u64 {
+        return Err(Ext2Error::UnsupportedFeature);
+    }
+    let pointer_capacity = metadata.block_size / 4;
+    let mut allocation_capacity = DIRECT_BLOCKS;
+    if inode.single_indirect != 0 {
+        allocation_capacity = allocation_capacity
+            .checked_add(pointer_capacity + 1)
+            .ok_or(Ext2Error::AllocationFailed)?;
+    }
+    if inode.double_indirect != 0 {
+        allocation_capacity = allocation_capacity
+            .checked_add(
+                pointer_capacity
+                    .checked_mul(pointer_capacity)
+                    .and_then(|blocks| blocks.checked_add(pointer_capacity + 1))
+                    .ok_or(Ext2Error::AllocationFailed)?,
+            )
+            .ok_or(Ext2Error::AllocationFailed)?;
+    }
+    let mut blocks = Vec::new();
+    blocks
+        .try_reserve_exact(allocation_capacity)
+        .map_err(|_| Ext2Error::AllocationFailed)?;
+    for block in inode.blocks.iter().copied().filter(|block| *block != 0) {
+        if block >= metadata.blocks_count {
+            return Err(Ext2Error::InvalidFilesystem);
+        }
+        push_unique_block(&mut blocks, block)?;
+    }
+    if inode.single_indirect != 0 {
+        if inode.single_indirect >= metadata.blocks_count {
+            return Err(Ext2Error::InvalidFilesystem);
+        }
+        let mut pointers = zeroed_block();
+        read_block(metadata, inode.single_indirect, &mut pointers)?;
+        for index in 0..pointer_capacity {
+            let block = le32(&pointers, index * 4);
+            if block != 0 {
+                if block >= metadata.blocks_count {
+                    return Err(Ext2Error::InvalidFilesystem);
+                }
+                push_unique_block(&mut blocks, block)?;
+            }
+        }
+        push_unique_block(&mut blocks, inode.single_indirect)?;
+    }
+    if inode.double_indirect != 0 {
+        if inode.double_indirect >= metadata.blocks_count {
+            return Err(Ext2Error::InvalidFilesystem);
+        }
+        let mut root = zeroed_block();
+        read_block(metadata, inode.double_indirect, &mut root)?;
+        for index in 0..pointer_capacity {
+            let indirect = le32(&root, index * 4);
+            if indirect == 0 {
+                continue;
+            }
+            if indirect >= metadata.blocks_count {
+                return Err(Ext2Error::InvalidFilesystem);
+            }
+            let mut pointers = zeroed_block();
+            read_block(metadata, indirect, &mut pointers)?;
+            for pointer_index in 0..pointer_capacity {
+                let block = le32(&pointers, pointer_index * 4);
+                if block != 0 {
+                    if block >= metadata.blocks_count {
+                        return Err(Ext2Error::InvalidFilesystem);
+                    }
+                    push_unique_block(&mut blocks, block)?;
+                }
+            }
+            push_unique_block(&mut blocks, indirect)?;
+        }
+        push_unique_block(&mut blocks, inode.double_indirect)?;
+    }
+    Ok(blocks)
 }
 
 fn update_directory_link_count(
@@ -864,7 +1120,11 @@ fn update_directory_link_count(
         u32::try_from(root.size).map_err(|_| Ext2Error::UnsupportedFeature)?,
         links,
         &root.blocks,
+        root.single_indirect,
+        root.double_indirect,
+        root.allocated_blocks_512,
         false,
+        None,
     )
 }
 
@@ -970,13 +1230,17 @@ fn create_directory_in(
         metadata.block_size as u32,
         2,
         &inode_blocks,
+        0,
+        0,
+        u32::try_from(metadata.block_size / 512).map_err(|_| Ext2Error::InvalidFilesystem)?,
         true,
+        None,
     )?;
     write_block(metadata, block_bitmap_number, &block_bitmap)?;
     write_block(metadata, inode_bitmap_number, &inode_bitmap)?;
-    update_free_counters(metadata, &mut descriptor, -1, -1)?;
+    update_free_counters(metadata, &mut descriptor, -1, -1, None)?;
     update_directory_link_count(metadata, parent_number, true)?;
-    add_directory_entry(metadata, parent, name, inode_number, 2)
+    add_directory_entry(metadata, parent, name, inode_number, 2, None)
 }
 
 fn remove_root_entry_allocations(
@@ -1011,9 +1275,22 @@ fn remove_root_entry_allocations(
         &mut descriptor,
         i32::try_from(data_blocks.len()).map_err(|_| Ext2Error::InvalidFilesystem)?,
         1,
+        None,
     )?;
     let empty_blocks = [0; DIRECT_BLOCKS];
-    write_inode_fields(metadata, inode_number, 0, 0, 0, &empty_blocks, true)?;
+    write_inode_fields(
+        metadata,
+        inode_number,
+        0,
+        0,
+        0,
+        &empty_blocks,
+        0,
+        0,
+        0,
+        true,
+        None,
+    )?;
     if inode.mode & 0xf000 == 0x4000 {
         update_directory_link_count(metadata, parent_number, false)?;
     }
@@ -1039,19 +1316,10 @@ pub fn remove_file(path: &str) -> Result<(), Ext2Error> {
     if inode.mode & 0xf000 != 0x8000 {
         return Err(Ext2Error::InvalidPath);
     }
-    if inode.size > (metadata.block_size * DIRECT_BLOCKS) as u64
-        || inode.single_indirect != 0
-        || inode.double_indirect != 0
-        || inode_block_count(metadata, inode)? > DIRECT_BLOCKS
-    {
+    if inode.size > (double_indirect_capacity(metadata)? * metadata.block_size) as u64 {
         return Err(Ext2Error::UnsupportedFeature);
     }
-    let mut blocks = [0; DIRECT_BLOCKS];
-    let mut block_count = 0;
-    for block in inode.blocks.iter().copied().filter(|block| *block != 0) {
-        blocks[block_count] = block;
-        block_count += 1;
-    }
+    let blocks = collect_file_allocations(metadata, inode)?;
     remove_root_entry_allocations(
         metadata,
         parent_number,
@@ -1059,7 +1327,7 @@ pub fn remove_file(path: &str) -> Result<(), Ext2Error> {
         name,
         inode_number,
         inode,
-        &blocks[..block_count],
+        &blocks,
     )
 }
 
@@ -1100,9 +1368,11 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
     let _guard = EXT2_WRITE_LOCK.lock();
     let metadata = writable_metadata()?;
     let (_, parent, name) = resolve_parent(metadata, path)?;
+    let pointer_capacity = metadata.block_size / 4;
+    let single_capacity = single_indirect_capacity(metadata)?;
     let max_file_size = metadata
         .block_size
-        .checked_mul(DIRECT_BLOCKS)
+        .checked_mul(double_indirect_capacity(metadata)?)
         .ok_or(Ext2Error::UnsupportedFeature)?;
     if contents.len() > max_file_size || contents.len() > u32::MAX as usize {
         return Err(Ext2Error::UnsupportedFeature);
@@ -1114,10 +1384,7 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
             if inode.mode & 0xf000 != 0x8000 {
                 return Err(Ext2Error::InvalidPath);
             }
-            if inode.size > max_file_size as u64
-                || inode.single_indirect != 0
-                || inode.double_indirect != 0
-            {
+            if inode.size > max_file_size as u64 {
                 return Err(Ext2Error::UnsupportedFeature);
             }
             (inode_number, Some(inode))
@@ -1129,19 +1396,17 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
         ensure_directory_entry_space(metadata, parent, name)?;
     }
 
-    let mut descriptor = zeroed_block();
-    read_block(metadata, metadata.first_data_block + 1, &mut descriptor)?;
-    let block_bitmap_number = le32(&descriptor, 0);
-    let inode_bitmap_number = le32(&descriptor, 4);
-    if block_bitmap_number >= metadata.blocks_count || inode_bitmap_number >= metadata.blocks_count
-    {
-        return Err(Ext2Error::InvalidFilesystem);
-    }
-    let mut block_bitmap = zeroed_block();
-    let mut inode_bitmap = zeroed_block();
-    read_block(metadata, block_bitmap_number, &mut block_bitmap)?;
-    read_block(metadata, inode_bitmap_number, &mut inode_bitmap)?;
-
+    let old_blocks = match existing_inode {
+        Some(inode) => collect_file_allocations(metadata, inode)?,
+        None => Vec::new(),
+    };
+    let (
+        block_bitmap_number,
+        inode_bitmap_number,
+        mut descriptor,
+        mut block_bitmap,
+        mut inode_bitmap,
+    ) = read_allocation_tables(metadata)?;
     let allocated_inode = if new_inode {
         find_free_bit(&inode_bitmap, metadata.inodes_count)
             .and_then(|index| index.checked_add(1))
@@ -1149,94 +1414,148 @@ pub fn write_file(path: &str, contents: &[u8]) -> Result<(), Ext2Error> {
     } else {
         inode_number
     };
-    let mut data_blocks = existing_inode.map_or([0; DIRECT_BLOCKS], |inode| inode.blocks);
-    if existing_inode.is_some_and(|inode| inode.single_indirect != 0 || inode.double_indirect != 0)
-    {
-        return Err(Ext2Error::UnsupportedFeature);
+    let required_blocks = contents.len().div_ceil(metadata.block_size);
+    let mut data_blocks = Vec::new();
+    data_blocks
+        .try_reserve_exact(required_blocks)
+        .map_err(|_| Ext2Error::AllocationFailed)?;
+    data_blocks.resize(required_blocks, 0);
+    let mut single_indirect = 0;
+    let mut double_indirect = 0;
+    let required_single_indirect = required_blocks > DIRECT_BLOCKS;
+    let required_double_leaves = required_blocks
+        .saturating_sub(single_capacity)
+        .div_ceil(pointer_capacity);
+    let mut double_leaves = Vec::new();
+    double_leaves
+        .try_reserve_exact(required_double_leaves)
+        .map_err(|_| Ext2Error::AllocationFailed)?;
+    double_leaves.resize(required_double_leaves, 0);
+    if required_single_indirect {
+        single_indirect = allocate_data_block(metadata, &mut block_bitmap)?;
     }
-    let required_blocks = contents.len() / metadata.block_size
-        + usize::from(contents.len() % metadata.block_size != 0);
-    let mut newly_allocated_count = 0;
-    for data_block in data_blocks.iter_mut().take(required_blocks) {
-        if *data_block != 0 {
-            continue;
-        }
-        let block_index = find_free_bit(
-            &block_bitmap,
-            metadata.blocks_count - metadata.first_data_block,
-        )
-        .ok_or(Ext2Error::NoSpace)?;
-        let block = block_index
-            .checked_add(metadata.first_data_block)
-            .ok_or(Ext2Error::InvalidFilesystem)?;
-        let bit = block - metadata.first_data_block;
-        block_bitmap[bit as usize / 8] |= 1 << (bit % 8);
-        *data_block = block;
-        newly_allocated_count += 1;
+    if required_double_leaves != 0 {
+        double_indirect = allocate_data_block(metadata, &mut block_bitmap)?;
     }
-    let new_block_count =
-        u16::try_from(newly_allocated_count).map_err(|_| Ext2Error::InvalidFilesystem)?;
-    let new_data_blocks =
-        u32::try_from(newly_allocated_count).map_err(|_| Ext2Error::InvalidFilesystem)?;
-    let mut superblock = zeroed_block();
-    let (super_free_blocks, super_free_inodes) = if new_inode || newly_allocated_count != 0 {
-        let free_blocks = le16(&descriptor, 12);
-        let free_inodes = le16(&descriptor, 14);
-        if free_blocks < new_block_count || (new_inode && free_inodes == 0) {
-            return Err(Ext2Error::InvalidFilesystem);
-        }
-        read_block(metadata, metadata.first_data_block, &mut superblock)?;
-        let super_free_blocks = le32(&superblock, 12);
-        let super_free_inodes = le32(&superblock, 16);
-        if super_free_blocks < new_data_blocks || (new_inode && super_free_inodes == 0) {
-            return Err(Ext2Error::InvalidFilesystem);
-        }
-        (super_free_blocks, super_free_inodes)
-    } else {
-        (0, 0)
-    };
+    for leaf in &mut double_leaves {
+        *leaf = allocate_data_block(metadata, &mut block_bitmap)?;
+    }
+    for data_block in &mut data_blocks {
+        *data_block = allocate_data_block(metadata, &mut block_bitmap)?;
+    }
+    let allocated_blocks = required_blocks
+        + usize::from(required_single_indirect)
+        + usize::from(required_double_leaves != 0)
+        + required_double_leaves;
+    let allocated_block_count =
+        i32::try_from(allocated_blocks).map_err(|_| Ext2Error::InvalidFilesystem)?;
 
     for (index, contents_chunk) in contents.chunks(metadata.block_size).enumerate() {
         let mut data = zeroed_block();
         data[..contents_chunk.len()].copy_from_slice(contents_chunk);
         write_block(metadata, data_blocks[index], &data)?;
     }
-    if newly_allocated_count != 0 {
-        write_block(metadata, block_bitmap_number, &block_bitmap)?;
+    if single_indirect != 0 {
+        let mut pointer_block = zeroed_block();
+        for index in 0..pointer_capacity {
+            let block = data_blocks.get(DIRECT_BLOCKS + index).copied().unwrap_or(0);
+            pointer_block[index * 4..index * 4 + 4].copy_from_slice(&block.to_le_bytes());
+        }
+        write_block(metadata, single_indirect, &pointer_block)?;
     }
-    if new_inode {
-        let bit = allocated_inode - 1;
-        inode_bitmap[bit as usize / 8] |= 1 << (bit % 8);
-        write_block(metadata, inode_bitmap_number, &inode_bitmap)?;
+    if required_double_leaves != 0 {
+        let mut root = zeroed_block();
+        for (index, leaf) in double_leaves.iter().copied().enumerate() {
+            root[index * 4..index * 4 + 4].copy_from_slice(&leaf.to_le_bytes());
+        }
+        for outer_index in 0..required_double_leaves {
+            let mut pointers = zeroed_block();
+            for inner_index in 0..pointer_capacity {
+                let logical_index = single_capacity + outer_index * pointer_capacity + inner_index;
+                let block = data_blocks.get(logical_index).copied().unwrap_or(0);
+                pointers[inner_index * 4..inner_index * 4 + 4]
+                    .copy_from_slice(&block.to_le_bytes());
+            }
+            write_block(metadata, double_leaves[outer_index], &pointers)?;
+        }
+        write_block(metadata, double_indirect, &root)?;
     }
-    if new_inode || newly_allocated_count != 0 {
-        let free_blocks = le16(&descriptor, 12);
-        let free_inodes = le16(&descriptor, 14);
-        let updated_free_blocks = free_blocks - new_block_count;
-        let updated_free_inodes = free_inodes - u16::from(new_inode);
-        descriptor[12..14].copy_from_slice(&updated_free_blocks.to_le_bytes());
-        descriptor[14..16].copy_from_slice(&updated_free_inodes.to_le_bytes());
-        write_block(metadata, metadata.first_data_block + 1, &descriptor)?;
+    let mut direct_blocks = [0; DIRECT_BLOCKS];
+    for (index, block) in data_blocks.iter().take(DIRECT_BLOCKS).enumerate() {
+        direct_blocks[index] = *block;
+    }
+    let sectors_per_block =
+        u32::try_from(metadata.block_size / 512).map_err(|_| Ext2Error::InvalidFilesystem)?;
+    let allocated_blocks_512 = u32::try_from(allocated_blocks)
+        .ok()
+        .and_then(|blocks| blocks.checked_mul(sectors_per_block))
+        .ok_or(Ext2Error::InvalidFilesystem)?;
 
-        superblock[12..16].copy_from_slice(&(super_free_blocks - new_data_blocks).to_le_bytes());
-        superblock[16..20]
-            .copy_from_slice(&(super_free_inodes - u32::from(new_inode)).to_le_bytes());
-        write_block(metadata, metadata.first_data_block, &superblock)?;
-    }
+    let mut transaction = BlockTransaction::new();
+    let commit_result = (|| {
+        if allocated_blocks != 0 {
+            transaction.write(metadata, block_bitmap_number, &block_bitmap)?;
+        }
+        if new_inode {
+            let bit = allocated_inode - 1;
+            inode_bitmap[bit as usize / 8] |= 1 << (bit % 8);
+            transaction.write(metadata, inode_bitmap_number, &inode_bitmap)?;
+        }
+        update_free_counters(
+            metadata,
+            &mut descriptor,
+            -allocated_block_count,
+            -i32::from(new_inode),
+            Some(&mut transaction),
+        )?;
 
-    write_inode_fields(
-        metadata,
-        allocated_inode,
-        0x81a4,
-        u32::try_from(contents.len()).map_err(|_| Ext2Error::UnsupportedFeature)?,
-        1,
-        &data_blocks,
-        new_inode,
-    )?;
-    if new_inode {
-        add_directory_entry(metadata, parent, name, allocated_inode, 1)?;
+        write_inode_fields(
+            metadata,
+            allocated_inode,
+            0x81a4,
+            u32::try_from(contents.len()).map_err(|_| Ext2Error::UnsupportedFeature)?,
+            1,
+            &direct_blocks,
+            single_indirect,
+            double_indirect,
+            allocated_blocks_512,
+            new_inode,
+            Some(&mut transaction),
+        )?;
+        if new_inode {
+            add_directory_entry(
+                metadata,
+                parent,
+                name,
+                allocated_inode,
+                1,
+                Some(&mut transaction),
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = commit_result {
+        transaction.rollback(metadata)?;
+        return Err(error);
+    }
+    let mut cleanup_transaction = BlockTransaction::new();
+    if let Err(error) = free_data_blocks(metadata, &old_blocks, Some(&mut cleanup_transaction)) {
+        let cleanup_rollback = cleanup_transaction.rollback(metadata);
+        let commit_rollback = transaction.rollback(metadata);
+        if cleanup_rollback.is_err() || commit_rollback.is_err() {
+            return Err(Ext2Error::RecoveryFailed);
+        }
+        return Err(error);
     }
     Ok(())
+}
+
+/// Return the free data-block count recorded in the mounted ext2 superblock.
+pub fn free_block_count() -> Result<u32, Ext2Error> {
+    let metadata = metadata()?;
+    let mut superblock = zeroed_block();
+    read_block(metadata, metadata.first_data_block, &mut superblock)?;
+    Ok(le32(&superblock, 12))
 }
 
 fn for_each_child(
@@ -1332,6 +1651,35 @@ pub fn read_file(path: &str, output: &mut [u8]) -> Result<Option<(usize, u64)>, 
     if inode.mode & 0xf000 != 0x8000 {
         return Ok(None);
     }
+    read_inode_contents(metadata, inode, output).map(Some)
+}
+
+pub fn read_file_vec(path: &str, max_size: usize) -> Result<Option<Vec<u8>>, Ext2Error> {
+    let metadata = metadata()?;
+    let Some(inode) = lookup(path)? else {
+        return Ok(None);
+    };
+    if inode.mode & 0xf000 != 0x8000 {
+        return Ok(None);
+    }
+    let size = usize::try_from(inode.size).map_err(|_| Ext2Error::UnsupportedFeature)?;
+    if size > max_size {
+        return Err(Ext2Error::FileTooLarge);
+    }
+    let mut contents = Vec::new();
+    contents
+        .try_reserve_exact(size)
+        .map_err(|_| Ext2Error::AllocationFailed)?;
+    contents.resize(size, 0);
+    read_inode_contents(metadata, inode, &mut contents)?;
+    Ok(Some(contents))
+}
+
+fn read_inode_contents(
+    metadata: Metadata,
+    inode: Inode,
+    output: &mut [u8],
+) -> Result<(usize, u64), Ext2Error> {
     let block_count = inode_block_count(metadata, inode)?;
     let copy_len = usize::try_from(inode.size)
         .unwrap_or(usize::MAX)
@@ -1367,5 +1715,5 @@ pub fn read_file(path: &str, output: &mut [u8]) -> Result<Option<(usize, u64)>, 
         }
         copied += amount;
     }
-    Ok(Some((copied, inode.size)))
+    Ok((copied, inode.size))
 }

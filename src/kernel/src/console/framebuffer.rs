@@ -1,6 +1,7 @@
 use crate::boot_info::{self, BootInfo};
 use crate::misc::font::get_glyph;
 use crate::sync::{Mutex, Once};
+use alloc::collections::VecDeque;
 use core::fmt;
 use core::ptr::NonNull;
 
@@ -95,9 +96,28 @@ const MARGIN: usize = 8;
 const CHAR_WIDTH: usize = 8;
 const LINE_HEIGHT: usize = 16;
 const INPUT_LINE_CAPACITY: usize = 256;
+const SCROLLBACK_LINE_CAPACITY: usize = 256;
+const SCROLLBACK_COLUMN_CAPACITY: usize = 256;
 const EDITOR_MAX_COLUMNS: usize = 256;
 const EDITOR_MAX_ROWS: usize = 128;
 const DEFAULT_FG: (u8, u8, u8) = (0, 255, 0); // terminal green
+
+#[derive(Clone, Copy)]
+struct TerminalLine {
+    id: u64,
+    bytes: [u8; SCROLLBACK_COLUMN_CAPACITY],
+    colors: [u32; SCROLLBACK_COLUMN_CAPACITY],
+}
+
+impl TerminalLine {
+    const fn new(id: u64) -> Self {
+        Self {
+            id,
+            bytes: [b' '; SCROLLBACK_COLUMN_CAPACITY],
+            colors: [0; SCROLLBACK_COLUMN_CAPACITY],
+        }
+    }
+}
 
 pub struct FramebufferWriter {
     info: FramebufferInfo,
@@ -111,6 +131,11 @@ pub struct FramebufferWriter {
     cursor_overlay: Option<(usize, usize, u8)>,
     editor_active: bool,
     editor_cells: [[u8; EDITOR_MAX_COLUMNS]; EDITOR_MAX_ROWS],
+    history: VecDeque<TerminalLine>,
+    current_line_id: u64,
+    scrollback_offset: usize,
+    input_origin_history: Option<(u64, usize)>,
+    input_history_cells: [(u64, usize); INPUT_LINE_CAPACITY],
 }
 
 impl FramebufferWriter {
@@ -127,6 +152,11 @@ impl FramebufferWriter {
             cursor_overlay: None,
             editor_active: false,
             editor_cells: [[b' '; EDITOR_MAX_COLUMNS]; EDITOR_MAX_ROWS],
+            history: VecDeque::new(),
+            current_line_id: 0,
+            scrollback_offset: 0,
+            input_origin_history: None,
+            input_history_cells: [(0, 0); INPUT_LINE_CAPACITY],
         };
         writer.clear();
         writer
@@ -139,9 +169,14 @@ impl FramebufferWriter {
     pub fn clear(&mut self) {
         let total_size = self.info.stride * self.info.height;
         self.info.buffer.write_bytes(0, total_size, 0);
+        self.history.clear();
+        self.history.push_back(TerminalLine::new(0));
+        self.current_line_id = 0;
+        self.scrollback_offset = 0;
         self.x = MARGIN;
         self.y = MARGIN;
         self.input_origin = None;
+        self.input_origin_history = None;
         self.input_cell_count = 0;
         self.cursor_overlay = None;
         self.editor_active = false;
@@ -169,12 +204,17 @@ impl FramebufferWriter {
 
     fn begin_input_line(&mut self) {
         self.input_origin = Some((self.x, self.y));
+        self.input_origin_history = Some((
+            self.current_line_id,
+            self.x.saturating_sub(MARGIN) / CHAR_WIDTH,
+        ));
         self.input_cell_count = 0;
     }
 
     fn finish_input_line(&mut self) {
         self.remove_cursor_overlay();
         self.input_origin = None;
+        self.input_origin_history = None;
         self.input_cell_count = 0;
     }
 
@@ -184,11 +224,27 @@ impl FramebufferWriter {
         };
         self.remove_cursor_overlay();
         let old_cell_count = self.input_cell_count;
+        for index in 0..old_cell_count {
+            let (line_id, column) = self.input_history_cells[index];
+            self.set_history_cell(line_id, column, b' ', 0);
+        }
+        let Some((origin_line, _)) = self.input_origin_history else {
+            return;
+        };
+        self.current_line_id = origin_line;
         self.x = origin_x;
         self.y = origin_y;
+        let history_color =
+            (u32::from(self.fg.0) << 16) | (u32::from(self.fg.1) << 8) | u32::from(self.fg.2);
         for (index, byte) in bytes.iter().copied().enumerate() {
             self.wrap_if_needed();
             let new_cell = (self.x, self.y);
+            let history_cell = (
+                self.current_line_id,
+                self.x.saturating_sub(MARGIN) / CHAR_WIDTH,
+            );
+            self.input_history_cells[index] = history_cell;
+            self.set_history_cell(history_cell.0, history_cell.1, byte, history_color);
             let old_cell = self.input_cells.get(index).copied();
             let changed = index >= old_cell_count
                 || self.input_bytes[index] != byte
@@ -212,6 +268,7 @@ impl FramebufferWriter {
             let (x, y) = self.input_cells[index];
             self.clear_character(x, y);
         }
+        self.trim_history_after(self.current_line_id);
         self.input_cell_count = bytes.len();
         if cursor < bytes.len() {
             (self.x, self.y) = self.input_cells[cursor];
@@ -231,8 +288,12 @@ impl FramebufferWriter {
     }
 
     fn draw_character_at(&mut self, x: usize, y: usize, byte: u8) {
+        self.draw_character_with_color(x, y, byte, self.fg);
+    }
+
+    fn draw_character_with_color(&mut self, x: usize, y: usize, byte: u8, color: (u8, u8, u8)) {
         let glyph = get_glyph(byte);
-        let (r, g, b) = self.fg;
+        let (r, g, b) = color;
         for (row, row_data) in glyph.iter().copied().enumerate() {
             for col in 0..CHAR_WIDTH {
                 if (row_data >> (7 - col)) & 1 == 1 {
@@ -471,6 +532,8 @@ impl FramebufferWriter {
 
     pub fn new_line(&mut self) {
         self.x = MARGIN;
+        self.current_line_id = self.current_line_id.wrapping_add(1);
+        self.ensure_history_line(self.current_line_id);
         if self.y + LINE_HEIGHT + MARGIN + LINE_HEIGHT > self.info.height {
             self.scroll_up(LINE_HEIGHT);
         } else {
@@ -479,6 +542,10 @@ impl FramebufferWriter {
     }
 
     pub fn draw_ascii_char(&mut self, c: u8) {
+        let column = self.x.saturating_sub(MARGIN) / CHAR_WIDTH;
+        let color =
+            (u32::from(self.fg.0) << 16) | (u32::from(self.fg.1) << 8) | u32::from(self.fg.2);
+        self.set_history_cell(self.current_line_id, column, c, color);
         let glyph = get_glyph(c);
         let (r, g, b) = self.fg;
         for row in 0..8 {
@@ -490,6 +557,126 @@ impl FramebufferWriter {
             }
         }
         self.x += CHAR_WIDTH;
+    }
+
+    fn ensure_history_line(&mut self, id: u64) {
+        while self.history.back().is_none_or(|line| line.id < id) {
+            let next_id = self.history.back().map_or(id, |line| line.id + 1);
+            self.history.push_back(TerminalLine::new(next_id));
+            if self.history.len() > SCROLLBACK_LINE_CAPACITY {
+                self.history.pop_front();
+            }
+        }
+    }
+
+    fn set_history_cell(&mut self, id: u64, column: usize, byte: u8, color: u32) {
+        if column >= SCROLLBACK_COLUMN_CAPACITY {
+            return;
+        }
+        if let Some(line) = self.history.iter_mut().find(|line| line.id == id) {
+            line.bytes[column] = byte;
+            line.colors[column] = color;
+        } else if id >= self.history.back().map_or(0, |line| line.id) {
+            self.ensure_history_line(id);
+            if let Some(line) = self.history.back_mut().filter(|line| line.id == id) {
+                line.bytes[column] = byte;
+                line.colors[column] = color;
+            }
+        }
+    }
+
+    fn trim_history_after(&mut self, id: u64) {
+        while self.history.back().is_some_and(|line| line.id > id) {
+            self.history.pop_back();
+        }
+    }
+
+    fn visible_rows(&self) -> usize {
+        self.info
+            .height
+            .saturating_sub(2 * MARGIN)
+            .checked_div(LINE_HEIGHT)
+            .unwrap_or(0)
+    }
+
+    fn scrollback_page(&mut self, up: bool) {
+        let oldest = self
+            .history
+            .front()
+            .map_or(self.current_line_id, |line| line.id);
+        let available = self.current_line_id.saturating_sub(oldest) as usize;
+        let page = (self.visible_rows() / 2).max(1);
+        if up {
+            self.scrollback_offset = self.scrollback_offset.saturating_add(page).min(available);
+        } else {
+            self.scrollback_offset = self.scrollback_offset.saturating_sub(page);
+        }
+        self.render_history_view();
+    }
+
+    fn render_history_view(&mut self) {
+        let total_size = self.info.stride * self.info.height;
+        self.info.buffer.write_bytes(0, total_size, 0);
+        let rows = self.visible_rows();
+        if rows == 0 {
+            return;
+        }
+        let viewing_history = self.scrollback_offset != 0;
+        let content_rows = rows.saturating_sub(usize::from(viewing_history));
+        let current_screen_row = self.y.saturating_sub(MARGIN) / LINE_HEIGHT;
+        let bottom_row = if viewing_history {
+            rows.saturating_sub(2)
+        } else {
+            current_screen_row.min(rows - 1)
+        };
+        let oldest = self
+            .history
+            .front()
+            .map_or(self.current_line_id, |line| line.id);
+        let end_id = self
+            .current_line_id
+            .saturating_sub(self.scrollback_offset as u64)
+            .max(oldest);
+        let visible_count = content_rows.min(bottom_row + 1);
+        let first_id = end_id
+            .saturating_sub(visible_count.saturating_sub(1) as u64)
+            .max(oldest);
+        for line_id in first_id..=end_id {
+            let screen_row = bottom_row.saturating_sub((end_id - line_id) as usize);
+            let Some(line) = self.history.iter().find(|line| line.id == line_id).copied() else {
+                continue;
+            };
+            for column in 0..self.info.width.saturating_sub(2 * MARGIN) / CHAR_WIDTH {
+                if column >= SCROLLBACK_COLUMN_CAPACITY {
+                    break;
+                }
+                let byte = line.bytes[column];
+                let color = line.colors[column];
+                if byte != b' ' {
+                    let color = (
+                        ((color >> 16) & 0xff) as u8,
+                        ((color >> 8) & 0xff) as u8,
+                        (color & 0xff) as u8,
+                    );
+                    self.draw_character_with_color(
+                        MARGIN + column * CHAR_WIDTH,
+                        MARGIN + screen_row * LINE_HEIGHT,
+                        byte,
+                        color,
+                    );
+                }
+            }
+        }
+        if viewing_history {
+            let status = b"SCROLLBACK PgUp/PgDn | Esc: live";
+            let y = MARGIN + (rows - 1) * LINE_HEIGHT;
+            for (column, byte) in status.iter().copied().enumerate() {
+                if MARGIN + column * CHAR_WIDTH + CHAR_WIDTH > self.info.width {
+                    break;
+                }
+                self.draw_character_with_color(MARGIN + column * CHAR_WIDTH, y, byte, self.fg);
+            }
+        }
     }
 }
 
@@ -504,6 +691,9 @@ impl fmt::Write for FramebufferWriter {
                     self.draw_ascii_char(byte);
                 }
             }
+        }
+        if self.scrollback_offset != 0 {
+            self.render_history_view();
         }
         Ok(())
     }
@@ -609,6 +799,45 @@ pub fn redraw_input_line(bytes: &[u8], cursor: usize) {
     });
 }
 
+pub fn scrollback_page_up() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().scrollback_page(true);
+        }
+    });
+}
+
+pub fn scrollback_page_down() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().scrollback_page(false);
+        }
+    });
+}
+
+pub fn scrollback_to_bottom() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            let mut writer = writer.lock();
+            if writer.scrollback_offset == 0 {
+                return false;
+            }
+            writer.scrollback_offset = 0;
+            writer.render_history_view();
+            return true;
+        }
+        false
+    })
+}
+
+pub fn is_scrollback_active() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        WRITER
+            .get()
+            .is_some_and(|writer| writer.lock().scrollback_offset != 0)
+    })
+}
+
 pub fn render_editor(name: &str, text: &str, cursor: usize, dirty: bool) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
@@ -639,6 +868,29 @@ pub fn _print(args: fmt::Arguments) {
     });
 }
 
+/// Render a byte-oriented console write without first treating user data as a
+/// NUL-terminated string or constructing a UTF-8 string from it.
+pub fn write_bytes(bytes: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            let mut writer = writer.lock();
+            for byte in bytes.iter().copied() {
+                match byte {
+                    b'\n' => writer.new_line(),
+                    b'\r' => {}
+                    byte => {
+                        writer.wrap_if_needed();
+                        writer.draw_ascii_char(byte);
+                    }
+                }
+            }
+            if writer.scrollback_offset != 0 {
+                writer.render_history_view();
+            }
+        }
+    });
+}
+
 #[macro_export]
 macro_rules! gop_print {
     ($($arg:tt)*) => ($crate::framebuffer::_print(format_args!($($arg)*)));
@@ -653,6 +905,7 @@ macro_rules! gop_println {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::fmt::Write;
 
     const TEST_WIDTH: usize = 640;
     const TEST_HEIGHT: usize = 480;
@@ -712,6 +965,43 @@ mod tests {
             let writer = WRITER.get().unwrap().lock();
             assert_eq!(writer.x, MARGIN);
             assert_eq!(writer.y, TEST_HEIGHT - MARGIN - LINE_HEIGHT);
+        });
+    }
+
+    #[test_case]
+    fn terminal_scrollback_is_bounded_and_pages_through_history() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            let mut writer = WRITER.get().unwrap().lock();
+            for index in 0..300 {
+                writeln!(writer, "row {}", index).unwrap();
+            }
+
+            assert_eq!(writer.history.len(), SCROLLBACK_LINE_CAPACITY);
+            assert_eq!(
+                writer.history.front().map(|line| line.id),
+                Some(writer.current_line_id - (SCROLLBACK_LINE_CAPACITY as u64 - 1))
+            );
+            writer.scrollback_page(true);
+            assert_eq!(writer.scrollback_offset, (writer.visible_rows() / 2).max(1));
+            writer.scrollback_page(false);
+            assert_eq!(writer.scrollback_offset, 0);
+        });
+    }
+
+    #[test_case]
+    fn input_redraw_updates_scrollback_text() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            begin_input_line();
+            redraw_input_line(b"abc", 3);
+            redraw_input_line(b"ab", 2);
+
+            let writer = WRITER.get().unwrap().lock();
+            let current = writer.history.back().unwrap();
+            assert_eq!(&current.bytes[..3], b"ab ");
         });
     }
 

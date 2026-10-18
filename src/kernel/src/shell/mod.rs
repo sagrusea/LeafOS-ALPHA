@@ -16,6 +16,8 @@ const KEY_DOWN: u8 = 0x83;
 const KEY_HOME: u8 = 0x84;
 const KEY_END: u8 = 0x85;
 const KEY_DELETE: u8 = 0x86;
+const KEY_PAGE_UP: u8 = 0x87;
+const KEY_PAGE_DOWN: u8 = 0x88;
 const EDITOR_MAX_BYTES: usize = 12 * 1024;
 
 static INPUT_QUEUE: [AtomicU8; QUEUE_CAPACITY] = [const { AtomicU8::new(0) }; QUEUE_CAPACITY];
@@ -201,14 +203,18 @@ enum Command<'a> {
     RemoveFile(&'a [u8]),
     RemoveDirectory(&'a [u8]),
     Edit(&'a [u8]),
+    Run(&'a [u8]),
+    DiskRun(&'a [u8]),
     ChangeDirectory(&'a [u8]),
     PrintWorkingDirectory,
     Settings,
     SetColor(&'a [u8]),
     SetResolution(&'a [u8]),
+    Info,
     InfoOs,
     InfoHardware,
     InfoSoftware,
+    Processes,
     Shutdown,
     Unknown,
     Empty,
@@ -289,6 +295,18 @@ fn parse_command(line: &[u8]) -> Command<'_> {
     {
         return Command::Edit(name);
     }
+    if line.eq_ignore_ascii_case(b"run") {
+        return Command::Run(&[]);
+    }
+    if let Some(path) = strip_command_arguments(line, b"run") {
+        return Command::Run(path);
+    }
+    if line.eq_ignore_ascii_case(b"diskrun") {
+        return Command::DiskRun(&[]);
+    }
+    if let Some(path) = strip_command_arguments(line, b"diskrun") {
+        return Command::DiskRun(path);
+    }
     if line.eq_ignore_ascii_case(b"cd") {
         return Command::ChangeDirectory(&[]);
     }
@@ -297,6 +315,12 @@ fn parse_command(line: &[u8]) -> Command<'_> {
     }
     if line.eq_ignore_ascii_case(b"pwd") {
         return Command::PrintWorkingDirectory;
+    }
+    if line.eq_ignore_ascii_case(b"info") {
+        return Command::Info;
+    }
+    if line.eq_ignore_ascii_case(b"ps") || line.eq_ignore_ascii_case(b"processes") {
+        return Command::Processes;
     }
     if line.eq_ignore_ascii_case(b"set") || line.eq_ignore_ascii_case(b"settings") {
         return Command::Settings;
@@ -628,6 +652,17 @@ impl TextEditor {
         self.cursor = target;
         changed
     }
+
+    fn move_page(&mut self, down: bool) -> bool {
+        let mut moved = false;
+        for _ in 0..12 {
+            if !self.move_vertical(down) {
+                break;
+            }
+            moved = true;
+        }
+        moved
+    }
 }
 
 fn vertical_cursor_target(text: &str, cursor: usize, down: bool) -> Option<usize> {
@@ -785,6 +820,8 @@ fn edit_disk_file(name: &str) {
             KEY_RIGHT => editor.move_right(),
             KEY_UP => editor.move_vertical(false),
             KEY_DOWN => editor.move_vertical(true),
+            KEY_PAGE_UP => editor.move_page(false),
+            KEY_PAGE_DOWN => editor.move_page(true),
             KEY_HOME => editor.move_line_boundary(false),
             KEY_END => editor.move_line_boundary(true),
             KEY_DELETE => editor.delete(),
@@ -803,11 +840,221 @@ fn edit_disk_file(name: &str) {
     }
 }
 
+fn print_process_list() {
+    let tasks = crate::scheduler::task_snapshot();
+    let mut count = 0;
+    gop_println!("ID   STATE       TYPE");
+    for task in tasks.into_iter().flatten() {
+        count += 1;
+        gop_println!(
+            "{:>3}  {:<11?} {}",
+            task.id.get(),
+            task.state,
+            if task.is_idle {
+                "idle"
+            } else if task.is_user {
+                "user app"
+            } else {
+                "kernel task"
+            }
+        );
+    }
+    gop_println!("{} scheduled task(s).", count);
+}
+
+#[derive(Clone, Copy)]
+struct RunningApp {
+    task: crate::scheduler::TaskId,
+    path: [u8; PATH_CAPACITY],
+    path_len: usize,
+}
+
+fn launch_app(
+    command_arguments: &[u8],
+    current_dir: &[u8],
+    use_ext2: bool,
+    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+) {
+    let Some(slot) = running_apps.iter().position(Option::is_none) else {
+        gop_println!("App tracking is full; wait for an app to finish.");
+        return;
+    };
+    let (path, raw_arguments) = split_first_word(command_arguments);
+    let Ok(path) = core::str::from_utf8(path) else {
+        gop_println!("Invalid app path.");
+        return;
+    };
+    let mut resolved = [0; PATH_CAPACITY];
+    let Some(path_len) = resolve_path(current_dir, path.as_bytes(), &mut resolved) else {
+        gop_println!("Invalid app path.");
+        return;
+    };
+    let Ok(resolved_path) = core::str::from_utf8(&resolved[..path_len]) else {
+        gop_println!("Invalid app path.");
+        return;
+    };
+    let mut arguments = [""; crate::user_program::MAX_PROGRAM_ARGUMENTS];
+    let mut argument_count = 0;
+    for argument in raw_arguments
+        .split(|byte| is_ascii_whitespace(*byte))
+        .filter(|argument| !argument.is_empty())
+    {
+        if argument_count == arguments.len() {
+            gop_println!(
+                "Too many arguments (maximum {}).",
+                crate::user_program::MAX_PROGRAM_ARGUMENTS
+            );
+            return;
+        }
+        let Ok(argument) = core::str::from_utf8(argument) else {
+            gop_println!("App arguments must be valid UTF-8.");
+            return;
+        };
+        arguments[argument_count] = argument;
+        argument_count += 1;
+    }
+    let launched = if use_ext2 {
+        crate::user_program::launch_from_ext2_with_arguments(
+            resolved_path,
+            &arguments[..argument_count],
+        )
+    } else {
+        crate::user_program::launch_with_arguments(resolved_path, &arguments[..argument_count])
+    };
+    match launched {
+        Ok(task) => {
+            let mut display_path = [0; PATH_CAPACITY];
+            display_path[..path_len].copy_from_slice(&resolved[..path_len]);
+            running_apps[slot] = Some(RunningApp {
+                task,
+                path: display_path,
+                path_len,
+            });
+            gop_println!("Started {} as user task {}.", resolved_path, task.get());
+        }
+        Err(error) => gop_println!("Could not start app: {:?}", error),
+    }
+}
+
+fn report_finished_apps(
+    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+    line: &LineEditor,
+    current_dir: &[u8],
+    current_dir_is_ext2: bool,
+) {
+    let mut finished_any = false;
+    for slot in running_apps {
+        let Some(app) = *slot else {
+            continue;
+        };
+        match crate::scheduler::task_state(app.task) {
+            Ok(crate::scheduler::TaskState::Terminated) => {
+                if !finished_any {
+                    crate::framebuffer::finish_input_line();
+                }
+                let path = core::str::from_utf8(&app.path[..app.path_len])
+                    .expect("shell app path is valid UTF-8");
+                match crate::scheduler::task_exit_code(app.task) {
+                    Ok(Some(exit_code)) => gop_println!(
+                        "App {} (task {}) exited with status {}.",
+                        path,
+                        app.task.get(),
+                        exit_code
+                    ),
+                    Ok(None) => gop_println!(
+                        "App {} (task {}) terminated without an exit status.",
+                        path,
+                        app.task.get()
+                    ),
+                    Err(error) => gop_println!(
+                        "Could not read exit status for app task {}: {:?}",
+                        app.task.get(),
+                        error
+                    ),
+                }
+                if let Err(error) = crate::scheduler::reap_terminated(app.task) {
+                    gop_println!("Could not release app task {}: {:?}", app.task.get(), error);
+                }
+                *slot = None;
+                finished_any = true;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                if !finished_any {
+                    crate::framebuffer::finish_input_line();
+                }
+                gop_println!("Could not monitor app task {}: {:?}", app.task.get(), error);
+                *slot = None;
+                finished_any = true;
+            }
+        }
+    }
+
+    if finished_any {
+        print_prompt(current_dir, current_dir_is_ext2);
+        redraw_command_line(line);
+    }
+}
+
+fn print_hardware_info() {
+    let cpuid = x86::cpuid::CpuId::new();
+    let vendor_info = cpuid.get_vendor_info();
+    let vendor = vendor_info
+        .as_ref()
+        .map(|info| info.as_str())
+        .unwrap_or("unknown");
+    let brand_info = cpuid.get_processor_brand_string();
+    let brand = brand_info
+        .as_ref()
+        .map(|info| info.as_str())
+        .unwrap_or("unknown CPU");
+    let physical_bits = cpuid
+        .get_processor_capacity_feature_info()
+        .map(|info| info.physical_address_bits())
+        .unwrap_or(0);
+    gop_println!("CPU: {}", brand);
+    gop_println!("Vendor: {}", vendor);
+    gop_println!("Physical address width: {} bits", physical_bits);
+}
+
+fn print_system_info() {
+    let (days, hours, minutes, seconds) =
+        crate::timer::split_uptime(crate::timer::uptime_seconds());
+    let task_count = crate::scheduler::task_snapshot()
+        .iter()
+        .filter(|task| task.is_some())
+        .count();
+    gop_println!("LeafOS kernel v{}", env!("CARGO_PKG_VERSION"));
+    gop_println!("Architecture: x86_64 | firmware: UEFI");
+    gop_println!(
+        "Uptime: {}d {:02}:{:02}:{:02}",
+        days,
+        hours,
+        minutes,
+        seconds
+    );
+    gop_println!(
+        "Heap mapped: {} KiB",
+        crate::memory::heap::mapped_bytes() / 1024
+    );
+    gop_println!(
+        "Scheduled tasks: {}/{}",
+        task_count,
+        crate::scheduler::MAX_TASKS
+    );
+    gop_println!(
+        "Timer: {} Hz PIT | filesystems: read-only initrd, ext2 data disk",
+        crate::timer::TICKS_PER_SECOND
+    );
+    print_hardware_info();
+}
+
 fn execute(
     line: &[u8],
     current_dir: &mut [u8; PATH_CAPACITY],
     current_dir_len: &mut usize,
     current_dir_is_ext2: &mut bool,
+    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
 ) {
     match parse_command(line) {
         Command::Help => {
@@ -829,11 +1076,15 @@ fn execute(
             gop_println!("  rm <path>                Remove an ext2 file");
             gop_println!("  rmdir <path>             Remove an empty ext2 directory");
             gop_println!("  edit <path>              Edit a UTF-8 text file on the ext2 disk");
+            gop_println!("  run <app> [args...]       Start an app from the current filesystem");
+            gop_println!("  diskrun <app> [args...]   Start an app from the ext2 data disk");
             gop_println!("  Up/Down                  Browse command history");
+            gop_println!("  PageUp/PageDown          Scroll terminal output; Esc returns");
             gop_println!("  Left/Right, Home/End     Edit the command line");
             gop_println!("  set col <color>          Change the terminal foreground color");
             gop_println!("  set res <w>:<h>          Check the requested resolution");
-            gop_println!("  info -os / -hw / -sw    Show system details");
+            gop_println!("  info [ -os | -hw | -sw ] Show detailed system information");
+            gop_println!("  ps / processes          List scheduled tasks");
             gop_println!(
                 "  shutdown / sd            Power off the system - DO NOT USE (halts cpu)"
             );
@@ -867,6 +1118,23 @@ fn execute(
             }
             _ => gop_println!("Usage: sleep <seconds> (0-3600)"),
         },
+        Command::Processes => print_process_list(),
+        Command::Run(path) if !path.is_empty() => launch_app(
+            path,
+            &current_dir[..*current_dir_len],
+            *current_dir_is_ext2,
+            running_apps,
+        ),
+        Command::Run(_) => gop_println!("Usage: run <path.app|path.bin> [args...]"),
+        Command::DiskRun(path) if !path.is_empty() => {
+            let ext2_current_dir = if *current_dir_is_ext2 {
+                &current_dir[..*current_dir_len]
+            } else {
+                &[]
+            };
+            launch_app(path, ext2_current_dir, true, running_apps);
+        }
+        Command::DiskRun(_) => gop_println!("Usage: diskrun <path.app|path.bin> [args...]"),
         Command::ListFiles(path) => {
             let mut resolved = [0; PATH_CAPACITY];
             if let Some(length) =
@@ -1175,34 +1443,27 @@ fn execute(
                 gop_println!("Usage: set res <width>:<height>");
             }
         }
-        Command::InfoOs => gop_println!("LeafOS Alpha 2A4 | x86_64 UEFI kernel"),
-        Command::InfoHardware => {
-            let cpuid = x86::cpuid::CpuId::new();
-            let vendor_info = cpuid.get_vendor_info();
-            let vendor = vendor_info
-                .as_ref()
-                .map(|info| info.as_str())
-                .unwrap_or("unknown");
-            let brand_info = cpuid.get_processor_brand_string();
-            let brand = brand_info
-                .as_ref()
-                .map(|info| info.as_str())
-                .unwrap_or("unknown CPU");
-            let physical_bits = cpuid
-                .get_processor_capacity_feature_info()
-                .map(|info| info.physical_address_bits())
-                .unwrap_or(0);
-            gop_println!("CPU: {}", brand);
-            gop_println!(
-                "Vendor: {} | physical address bits: {}",
-                vendor,
-                physical_bits
-            );
+        Command::Info => print_system_info(),
+        Command::InfoOs => {
+            gop_println!("LeafOS kernel v{}", env!("CARGO_PKG_VERSION"));
+            gop_println!("Architecture: x86_64");
+            gop_println!("Firmware interface: UEFI");
+            gop_println!("Kernel uptime: {} seconds", crate::timer::uptime_seconds());
         }
+        Command::InfoHardware => print_hardware_info(),
         Command::InfoSoftware => {
-            gop_println!("Kernel: LeafOS Alpha 2A4");
-            gop_println!("Shell: built-in command shell");
-            gop_println!("Heap: linked-list allocator with demand mapping");
+            gop_println!("Kernel: LeafOS v{}", env!("CARGO_PKG_VERSION"));
+            gop_println!("Shell: built-in kernel task");
+            gop_println!(
+                "Scheduler: round-robin, preempted at {} Hz",
+                crate::timer::TICKS_PER_SECOND
+            );
+            gop_println!(
+                "Task limit: {} scheduled tasks",
+                crate::scheduler::MAX_TASKS
+            );
+            gop_println!("Memory: linked-list heap with demand mapping");
+            gop_println!("Storage: read-only initrd and ext2 data disk");
         }
         Command::Shutdown => {
             gop_println!("Shutting down...");
@@ -1230,11 +1491,39 @@ pub fn run() -> ! {
     let mut current_dir = [0; PATH_CAPACITY];
     let mut current_dir_len = 0;
     let mut current_dir_is_ext2 = false;
+    let mut running_apps = [None; crate::scheduler::MAX_TASKS];
     gop_println!("LeafOS shell. Type 'help' for commands.");
     print_prompt(&current_dir[..current_dir_len], current_dir_is_ext2);
 
     loop {
-        match dequeue_key() {
+        report_finished_apps(
+            &mut running_apps,
+            &line,
+            &current_dir[..current_dir_len],
+            current_dir_is_ext2,
+        );
+        let key = dequeue_key();
+        match key {
+            Some(KEY_PAGE_UP) => {
+                crate::framebuffer::scrollback_page_up();
+                if !crate::framebuffer::is_scrollback_active() {
+                    redraw_command_line(&line);
+                }
+                continue;
+            }
+            Some(KEY_PAGE_DOWN) => {
+                crate::framebuffer::scrollback_page_down();
+                if !crate::framebuffer::is_scrollback_active() {
+                    redraw_command_line(&line);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if key.is_some() && crate::framebuffer::scrollback_to_bottom() {
+            redraw_command_line(&line);
+        }
+        match key {
             Some(b'\n' | b'\r') => {
                 line.cursor = line.length;
                 redraw_command_line(&line);
@@ -1246,6 +1535,7 @@ pub fn run() -> ! {
                     &mut current_dir,
                     &mut current_dir_len,
                     &mut current_dir_is_ext2,
+                    &mut running_apps,
                 );
                 line.clear();
                 print_prompt(&current_dir[..current_dir_len], current_dir_is_ext2);
@@ -1372,6 +1662,28 @@ mod tests {
             Command::Edit(b"NOTES.TXT")
         );
         assert_eq!(
+            parse_command(b"run apps/smoke.bin"),
+            Command::Run(b"apps/smoke.bin")
+        );
+        assert_eq!(
+            parse_command(b"run apps/smoke.app"),
+            Command::Run(b"apps/smoke.app")
+        );
+        assert_eq!(
+            parse_command(b"run apps/smoke.app hello world"),
+            Command::Run(b"apps/smoke.app hello world")
+        );
+        assert_eq!(parse_command(b"run"), Command::Run(b""));
+        assert_eq!(
+            parse_command(b"diskrun apps/smoke.app"),
+            Command::DiskRun(b"apps/smoke.app")
+        );
+        assert_eq!(
+            parse_command(b"diskrun apps/smoke.app --verbose"),
+            Command::DiskRun(b"apps/smoke.app --verbose")
+        );
+        assert_eq!(parse_command(b"diskrun"), Command::DiskRun(b""));
+        assert_eq!(
             parse_command(b"cat README.TXT"),
             Command::Cat(b"README.TXT")
         );
@@ -1383,7 +1695,12 @@ mod tests {
             parse_command(b"set res 1024:768"),
             Command::SetResolution(b"1024:768")
         );
+        assert_eq!(parse_command(b"info"), Command::Info);
+        assert_eq!(parse_command(b"info -os"), Command::InfoOs);
         assert_eq!(parse_command(b"info -hw"), Command::InfoHardware);
+        assert_eq!(parse_command(b"info -sw"), Command::InfoSoftware);
+        assert_eq!(parse_command(b"ps"), Command::Processes);
+        assert_eq!(parse_command(b"processes"), Command::Processes);
         assert_eq!(parse_command(b"shutdown"), Command::Shutdown);
         assert_eq!(parse_command(b"sd"), Command::Shutdown);
         assert_eq!(parse_command(b"SD"), Command::Shutdown);

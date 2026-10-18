@@ -1,0 +1,8 @@
+diff a/src/kernel/src/drivers/mod.rs b/src/kernel/src/drivers/mod.rs	(rejected hunks)
+@@ -1,5 +1,6 @@
+ 
+ pub mod ata;
++pub mod input;
+ pub mod keyboard;
+ pub mod pic8259;
+ 

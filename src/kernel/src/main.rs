@@ -43,7 +43,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     match kernel::fs::ext2::initialize() {
         Ok(()) => {
-            serial_println!("[OK] Read-only ext2 data disk mounted");
+            serial_println!("[OK] ext2 data disk mounted");
         }
         Err(error) => {
             serial_println!("[WARN] ext2 data disk unavailable: {:?}", error);

@@ -41,6 +41,14 @@ pub fn init_idt() {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
+    if interrupted_from_user(&stack_frame) {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+        crate::serial_println!(
+            "[USER FAULT] Task hit breakpoint at {:#x}",
+            stack_frame.instruction_pointer.as_u64()
+        );
+        crate::tasking::scheduler::exit_current();
+    }
     gop_println!("EXCEPTION: BREAKPOINT\n{:#?}", stack_frame);
 }
 
@@ -48,10 +56,23 @@ extern "x86-interrupt" fn double_fault_handler(
     stack_frame: InterruptStackFrame,
     _error_code: u64,
 ) -> ! {
+    if interrupted_from_user(&stack_frame) {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+        crate::serial_println!(
+            "[USER FAULT] Task double fault at {:#x}; terminating task",
+            stack_frame.instruction_pointer.as_u64()
+        );
+        crate::tasking::scheduler::exit_current();
+    }
     panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
 }
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    let from_user = interrupted_from_user(&stack_frame);
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
+
     crate::timer::on_interrupt();
 
     unsafe {
@@ -60,6 +81,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     }
 
     crate::tasking::scheduler::preempt_from_timer();
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -68,6 +92,17 @@ extern "x86-interrupt" fn page_fault_handler(
 ) {
     use x86_64::registers::control::Cr2;
 
+    if interrupted_from_user(&stack_frame) {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+        crate::serial_println!(
+            "[USER FAULT] Page fault at {:#x}, address {:?}, error {:?}; terminating task",
+            stack_frame.instruction_pointer.as_u64(),
+            Cr2::read(),
+            error_code
+        );
+        crate::tasking::scheduler::exit_current();
+    }
+
     gop_println!("EXCEPTION: PAGE FAULT");
     gop_println!("Accessed Adress: {:?}", Cr2::read());
     gop_println!("Error Code: {:?}", error_code);
@@ -75,11 +110,16 @@ extern "x86-interrupt" fn page_fault_handler(
     hlt_loop();
 }
 
+fn interrupted_from_user(stack_frame: &InterruptStackFrame) -> bool {
+    stack_frame.code_segment.0 & 3 == 3
+}
+
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use crate::drivers::{KeyCode, KeyState, Keyboard};
     use x86_64::instructions::port::Port;
 
     static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
+    let user_task_running = crate::tasking::scheduler::current_task_is_user();
 
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
@@ -92,7 +132,11 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                 if matches!(byte, b'\n' | b'\t' | 0x08 | 0x03 | 0x11 | 0x13 | 0x1b)
                     || (0x20..=0x7e).contains(&byte)
                 {
-                    shell::enqueue_key(byte);
+                    if user_task_running {
+                        crate::drivers::input::enqueue(byte);
+                    } else {
+                        shell::enqueue_key(byte);
+                    }
                 }
             } else {
                 let special_key = match event.code {
@@ -103,10 +147,16 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                     KeyCode::Home => Some(0x84),
                     KeyCode::End => Some(0x85),
                     KeyCode::Delete => Some(0x86),
+                    KeyCode::PageUp => Some(0x87),
+                    KeyCode::PageDown => Some(0x88),
                     _ => None,
                 };
                 if let Some(key) = special_key {
-                    shell::enqueue_key(key);
+                    if user_task_running {
+                        crate::drivers::input::enqueue(key);
+                    } else {
+                        shell::enqueue_key(key);
+                    }
                 }
             }
         }
