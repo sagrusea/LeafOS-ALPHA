@@ -20,9 +20,17 @@ pub const SYS_READ: u64 = 3;
 /// Read a file from ext2: `rdi=path`, `rsi=path length`, `rdx=destination`,
 /// `r10=destination capacity`. The path is a byte span, not NUL-terminated.
 pub const SYS_READ_FILE: u64 = 4;
+/// Create or replace an ext2 file: `rdi=path`, `rsi=path length`,
+/// `rdx=source`, `r10=source length`. Returns zero on success.
+pub const SYS_WRITE_FILE: u64 = 5;
+/// Voluntarily yield the CPU to another runnable task.
+pub const SYS_YIELD: u64 = 6;
+/// Sleep for a bounded number of timer ticks: `RDI=ticks`.
+pub const SYS_SLEEP: u64 = 7;
 
 pub const MAX_SYSCALL_BUFFER: usize = 4096;
 pub const MAX_SYSCALL_PATH: usize = 255;
+pub const MAX_SYSCALL_SLEEP_TICKS: u64 = 360_000;
 
 /// Errors are returned in RAX as the two's-complement representation of a
 /// negative errno, matching the existing `SYSCALL_NOT_IMPLEMENTED` convention.
@@ -162,7 +170,28 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         SYS_WRITE => sys_write(frame),
         SYS_READ => sys_read(frame),
         SYS_READ_FILE => sys_read_file(frame),
+        SYS_WRITE_FILE => sys_write_file(frame),
+        SYS_YIELD => sys_yield(),
+        SYS_SLEEP => sys_sleep(frame.rdi),
         _ => SYSCALL_NOT_IMPLEMENTED,
+    }
+}
+
+fn sys_yield() -> u64 {
+    match crate::tasking::scheduler::yield_now() {
+        Ok(()) => 0,
+        Err(crate::tasking::scheduler::SchedulerError::NoRunnableTasks) => 0,
+        Err(_) => SYS_ERR_EIO,
+    }
+}
+
+fn sys_sleep(ticks: u64) -> u64 {
+    if ticks > MAX_SYSCALL_SLEEP_TICKS {
+        return SYS_ERR_E2BIG;
+    }
+    match crate::tasking::scheduler::sleep_ticks(ticks) {
+        Ok(()) => 0,
+        Err(_) => SYS_ERR_EIO,
     }
 }
 
@@ -178,11 +207,7 @@ fn sys_write(frame: &SyscallFrame) -> u64 {
     // Never format or dereference the user pointer directly. First validate
     // every covered page, then make a bounded copy to kernel-owned storage.
     let mut buffer = [0u8; MAX_SYSCALL_BUFFER];
-    if crate::tasking::scheduler::copy_from_current_user(
-        frame.rdi,
-        &mut buffer[..length],
-    )
-    .is_err()
+    if crate::tasking::scheduler::copy_from_current_user(frame.rdi, &mut buffer[..length]).is_err()
     {
         return SYS_ERR_EFAULT;
     }
@@ -198,13 +223,7 @@ fn sys_read(frame: &SyscallFrame) -> u64 {
     if capacity == 0 {
         return 0;
     }
-    if crate::tasking::scheduler::validate_current_user_range(
-        frame.rdi,
-        capacity,
-        true,
-    )
-    .is_err()
-    {
+    if crate::tasking::scheduler::validate_current_user_range(frame.rdi, capacity, true).is_err() {
         return SYS_ERR_EFAULT;
     }
 
@@ -232,22 +251,15 @@ fn sys_read_file(frame: &SyscallFrame) -> u64 {
     // Check the output before performing disk I/O. This buffer must be writable,
     // not merely somewhere in the process's user virtual-address range.
     if capacity != 0
-        && crate::tasking::scheduler::validate_current_user_range(
-            frame.rdx,
-            capacity,
-            true,
-        )
-        .is_err()
+        && crate::tasking::scheduler::validate_current_user_range(frame.rdx, capacity, true)
+            .is_err()
     {
         return SYS_ERR_EFAULT;
     }
 
     let mut path_buffer = [0u8; MAX_SYSCALL_PATH];
-    if crate::tasking::scheduler::copy_from_current_user(
-        frame.rdi,
-        &mut path_buffer[..path_length],
-    )
-    .is_err()
+    if crate::tasking::scheduler::copy_from_current_user(frame.rdi, &mut path_buffer[..path_length])
+        .is_err()
     {
         return SYS_ERR_EFAULT;
     }
@@ -264,11 +276,8 @@ fn sys_read_file(frame: &SyscallFrame) -> u64 {
     match crate::fs::ext2::read_file(path, &mut buffer[..capacity]) {
         Ok(Some((count, _total))) => {
             if count != 0
-                && crate::tasking::scheduler::copy_to_current_user(
-                    frame.rdx,
-                    &buffer[..count],
-                )
-                .is_err()
+                && crate::tasking::scheduler::copy_to_current_user(frame.rdx, &buffer[..count])
+                    .is_err()
             {
                 return SYS_ERR_EFAULT;
             }
@@ -276,6 +285,52 @@ fn sys_read_file(frame: &SyscallFrame) -> u64 {
         }
         Ok(None) => SYS_ERR_ENOENT,
         Err(crate::fs::ext2::Ext2Error::InvalidPath) => SYS_ERR_EINVAL,
+        Err(_) => SYS_ERR_EIO,
+    }
+}
+
+fn sys_write_file(frame: &SyscallFrame) -> u64 {
+    if frame.rsi == 0 {
+        return SYS_ERR_EINVAL;
+    }
+    if frame.rsi > MAX_SYSCALL_PATH as u64 || frame.r10 > MAX_SYSCALL_BUFFER as u64 {
+        return SYS_ERR_E2BIG;
+    }
+
+    let path_length = frame.rsi as usize;
+    let contents_length = frame.r10 as usize;
+    let mut path_buffer = [0u8; MAX_SYSCALL_PATH];
+    if crate::tasking::scheduler::copy_from_current_user(frame.rdi, &mut path_buffer[..path_length])
+        .is_err()
+    {
+        return SYS_ERR_EFAULT;
+    }
+    let path_bytes = &path_buffer[..path_length];
+    if path_bytes.contains(&0) {
+        return SYS_ERR_EINVAL;
+    }
+    let path = match core::str::from_utf8(path_bytes) {
+        Ok(path) if !path.is_empty() => path,
+        _ => return SYS_ERR_EINVAL,
+    };
+
+    // Copy user data into kernel-owned memory before touching the filesystem.
+    // Empty files are valid and do not require the source pointer to be mapped.
+    let mut contents = [0u8; MAX_SYSCALL_BUFFER];
+    if contents_length != 0
+        && crate::tasking::scheduler::copy_from_current_user(
+            frame.rdx,
+            &mut contents[..contents_length],
+        )
+        .is_err()
+    {
+        return SYS_ERR_EFAULT;
+    }
+
+    match crate::fs::ext2::write_file(path, &contents[..contents_length]) {
+        Ok(()) => 0,
+        Err(crate::fs::ext2::Ext2Error::InvalidPath) => SYS_ERR_EINVAL,
+        Err(crate::fs::ext2::Ext2Error::NotFound) => SYS_ERR_ENOENT,
         Err(_) => SYS_ERR_EIO,
     }
 }

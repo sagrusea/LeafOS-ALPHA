@@ -1030,9 +1030,8 @@ fn test_user_console_write_syscall_bounds_and_validates_user_memory() {
     emit_exit_with_rax(&mut normal);
     let message_offset = normal.len();
     normal.extend_from_slice(b"hello");
-    normal[buffer_immediate..buffer_immediate + 8].copy_from_slice(
-        &(USER_SPACE_START + 0x1000 + message_offset as u64).to_le_bytes(),
-    );
+    normal[buffer_immediate..buffer_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + message_offset as u64).to_le_bytes());
     assert_eq!(run_user_test_program(&normal), 5);
 
     // Empty writes are harmless and do not inspect the supplied pointer.
@@ -1082,7 +1081,11 @@ fn test_user_input_syscall_is_nonblocking_and_checks_writable_buffers() {
     emit_mov_esi_imm32(&mut empty, 1);
     emit_syscall(&mut empty, syscall::SYS_READ as u32);
     emit_exit_with_rax(&mut empty);
-    assert_eq!(run_user_test_program(&empty), 0, "input must not block when the queue is empty");
+    assert_eq!(
+        run_user_test_program(&empty),
+        0,
+        "input must not block when the queue is empty"
+    );
 
     input::enqueue(b'Z');
 
@@ -1147,13 +1150,49 @@ fn test_user_file_read_syscall_reads_only_bounded_ext2_files() {
 
     let path_offset = code.len();
     code.extend_from_slice(PATH);
-    code[path_immediate..path_immediate + 8].copy_from_slice(
-        &(USER_SPACE_START + 0x1000 + path_offset as u64).to_le_bytes(),
-    );
+    code[path_immediate..path_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + path_offset as u64).to_le_bytes());
 
     let status = run_user_test_program(&code);
     ext2::remove_file("SYSCALL.TXT").expect("remove file from syscall read test");
-    assert_eq!(status, 42, "file syscall should copy the file contents to user memory");
+    assert_eq!(
+        status, 42,
+        "file syscall should copy the file contents to user memory"
+    );
+}
+
+#[test_case]
+fn test_user_file_write_syscall_persists_bounded_ext2_files() {
+    use kernel::{arch::syscall, fs::ext2, memory::USER_SPACE_START};
+
+    const PATH: &[u8] = b"SYSCALL-WRITE.TXT";
+    const CONTENTS: &[u8] = b"written by ring three";
+
+    let mut code = Vec::new();
+    let path_immediate = emit_mov_rdi_imm64(&mut code, 0);
+    emit_mov_esi_imm32(&mut code, PATH.len() as u32);
+    let contents_immediate = code.len() + 2; // immediate in `mov rdx, imm64`
+    emit_mov_rdx_imm64(&mut code, 0);
+    emit_mov_r10d_imm32(&mut code, CONTENTS.len() as u32);
+    emit_syscall(&mut code, syscall::SYS_WRITE_FILE as u32);
+    emit_exit_with_rax(&mut code);
+
+    let path_offset = code.len();
+    code.extend_from_slice(PATH);
+    let contents_offset = code.len();
+    code.extend_from_slice(CONTENTS);
+    code[path_immediate..path_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + path_offset as u64).to_le_bytes());
+    code[contents_immediate..contents_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + contents_offset as u64).to_le_bytes());
+
+    let status = run_user_test_program(&code);
+    assert_eq!(status, 0, "write-file syscall should report success");
+    let saved = ext2::read_file_vec("SYSCALL-WRITE.TXT", 64)
+        .expect("read back syscall-created file")
+        .expect("syscall-created file should exist");
+    assert_eq!(saved.as_slice(), CONTENTS);
+    ext2::remove_file("SYSCALL-WRITE.TXT").expect("remove syscall write test file");
 }
 
 #[test_case]
@@ -1256,6 +1295,26 @@ fn test_leaf_app_maps_code_and_data_and_exits_through_syscall() {
     assert_eq!(scheduler::task_state(task), Ok(TaskState::Terminated));
     assert_eq!(scheduler::task_exit_code(task), Ok(Some(42)));
     scheduler::reap_terminated(task).expect("reap LeafOS application");
+}
+
+#[test_case]
+fn test_sdk_wrapper_app_runs_from_initrd() {
+    let task = kernel::user_program::launch("apps/sdk-smoke.app")
+        .expect("load SDK wrapper smoke application from initrd");
+    scheduler::run_tasks().expect("run SDK wrapper smoke application");
+    assert_eq!(scheduler::task_state(task), Ok(TaskState::Terminated));
+    assert_eq!(scheduler::task_exit_code(task), Ok(Some(0)));
+    scheduler::reap_terminated(task).expect("reap SDK wrapper smoke application");
+}
+
+#[test_case]
+fn test_c_app_runtime_passes_arguments_and_main_status() {
+    let task = kernel::user_program::launch_with_arguments("apps/c-smoke.app", &["ok"])
+        .expect("load C runtime smoke application from initrd");
+    scheduler::run_tasks().expect("run C runtime smoke application");
+    assert_eq!(scheduler::task_state(task), Ok(TaskState::Terminated));
+    assert_eq!(scheduler::task_exit_code(task), Ok(Some(42)));
+    scheduler::reap_terminated(task).expect("reap C runtime smoke application");
 }
 
 #[test_case]

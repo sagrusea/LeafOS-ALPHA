@@ -199,11 +199,7 @@ impl AddressSpace {
     }
 
     /// Copy from a validated, readable buffer in this active process.
-    pub fn copy_from_user(
-        &self,
-        address: u64,
-        output: &mut [u8],
-    ) -> Result<(), UserMemoryError> {
+    pub fn copy_from_user(&self, address: u64, output: &mut [u8]) -> Result<(), UserMemoryError> {
         self.validate_user_range(address, output.len(), false)?;
         if output.is_empty() {
             return Ok(());
@@ -222,11 +218,7 @@ impl AddressSpace {
     }
 
     /// Copy into a validated, writable buffer in this active process.
-    pub fn copy_to_user(
-        &self,
-        address: u64,
-        input: &[u8],
-    ) -> Result<(), UserMemoryError> {
+    pub fn copy_to_user(&self, address: u64, input: &[u8]) -> Result<(), UserMemoryError> {
         self.validate_user_range(address, input.len(), true)?;
         if input.is_empty() {
             return Ok(());

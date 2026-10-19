@@ -19,6 +19,7 @@ pub const MAX_PROGRAM_ARGUMENTS: usize = 16;
 pub const MAX_PROGRAM_ARGUMENT_BYTES: usize = 1024;
 pub const USER_STACK_SIZE: usize = 16 * 1024;
 pub const USER_STACK_TOP: u64 = USER_SPACE_START + 0x20_0000;
+const USER_STACK_ARGUMENT_RESERVE: u64 = 256;
 
 #[derive(Debug)]
 pub enum ProgramError {
@@ -307,7 +308,8 @@ fn build_argument_vector(path: &str, arguments: &[&str]) -> Result<(Vec<u8>, u64
     }
 
     let stack_start = USER_STACK_TOP
-        .checked_sub(total_size as u64)
+        .checked_sub(USER_STACK_ARGUMENT_RESERVE)
+        .and_then(|address| address.checked_sub(total_size as u64))
         .ok_or(ProgramError::InvalidArguments)?;
     let mut stack_data = Vec::new();
     stack_data
@@ -389,7 +391,12 @@ fn load_segments(
         return Err(ProgramError::ImageTooLarge);
     }
     let (argument_data, argument_count) = build_argument_vector(path, arguments)?;
-    let argument_vector = VirtAddr::new(USER_STACK_TOP - argument_data.len() as u64);
+    let argument_vector = VirtAddr::new(
+        USER_STACK_TOP
+            .checked_sub(USER_STACK_ARGUMENT_RESERVE)
+            .and_then(|address| address.checked_sub(argument_data.len() as u64))
+            .ok_or(ProgramError::InvalidArguments)?,
+    );
 
     let stack_page_count = USER_STACK_SIZE / PAGE_SIZE as usize;
     let mut code_pages = Vec::new();
@@ -596,7 +603,7 @@ mod tests {
             .expect("build app argument vector");
         assert_eq!(argument_count, 3);
 
-        let vector_address = USER_STACK_TOP - vector.len() as u64;
+        let vector_address = USER_STACK_TOP - USER_STACK_ARGUMENT_RESERVE - vector.len() as u64;
         let pointers: Vec<u64> = (0..=argument_count as usize)
             .map(|index| {
                 u64::from_le_bytes(

@@ -836,10 +836,7 @@ pub fn copy_from_current_user(
 }
 
 /// Copy syscall output to a writable buffer in the currently running task.
-pub fn copy_to_current_user(
-    address: u64,
-    input: &[u8],
-) -> Result<(), memory::UserMemoryError> {
+pub fn copy_to_current_user(address: u64, input: &[u8]) -> Result<(), memory::UserMemoryError> {
     let scheduler = GLOBAL_SCHEDULER.lock();
     let task = scheduler
         .current

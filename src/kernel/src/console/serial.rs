@@ -26,7 +26,11 @@ pub fn write_bytes(bytes: &[u8]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         let mut serial = SERIAL1.lock();
         for byte in bytes.iter().copied() {
-            let character = if byte.is_ascii() { char::from(byte) } else { '?' };
+            let character = if byte.is_ascii() {
+                char::from(byte)
+            } else {
+                '?'
+            };
             serial
                 .write_char(character)
                 .expect("Printing to serial failed");
