@@ -240,6 +240,9 @@ impl Keyboard {
 
         match key {
             KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                if self.right_alt && c == 'w' {
+                    return Some(b'|');
+                }
                 let upper = shifted ^ self.caps_lock;
                 let mut byte = if upper {
                     c.to_ascii_uppercase() as u8
@@ -324,5 +327,27 @@ mod tests {
         let left = keyboard.process_scancode(0x4b).unwrap();
         assert_eq!(left.code, KeyCode::ArrowLeft);
         assert_eq!(left.ascii, None);
+    }
+
+    #[test_case]
+    fn right_alt_w_produces_pipe() {
+        let mut keyboard = Keyboard::new();
+        keyboard.process_scancode(0xe0);
+        assert_eq!(
+            keyboard.process_scancode(0x38).unwrap().code,
+            KeyCode::RightAlt
+        );
+        assert_eq!(keyboard.process_scancode(0x11).unwrap().ascii, Some(b'|'));
+        keyboard.process_scancode(0x91);
+        keyboard.process_scancode(0xe0);
+        keyboard.process_scancode(0xb8);
+        assert_eq!(keyboard.process_scancode(0x11).unwrap().ascii, Some(b'w'));
+    }
+
+    #[test_case]
+    fn decodes_ctrl_c_as_interrupt_byte() {
+        let mut keyboard = Keyboard::new();
+        keyboard.process_scancode(0x1d);
+        assert_eq!(keyboard.process_scancode(0x2e).unwrap().ascii, Some(0x03));
     }
 }

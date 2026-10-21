@@ -132,8 +132,15 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                 if matches!(byte, b'\n' | b'\t' | 0x08 | 0x03 | 0x11 | 0x13 | 0x1b)
                     || (0x20..=0x7e).contains(&byte)
                 {
-                    if user_task_running {
+                    if user_task_running && byte == 0x03 {
+                        unsafe {
+                            PICS.lock()
+                                .signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
+                        }
+                        crate::tasking::scheduler::exit_current_group_with_code(130);
+                    } else if user_task_running {
                         crate::drivers::input::enqueue(byte);
+                        crate::tasking::scheduler::wake_all_blocked_tasks();
                     } else {
                         shell::enqueue_key(byte);
                     }

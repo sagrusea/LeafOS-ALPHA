@@ -1,6 +1,7 @@
 use crate::arch::user::{UserContext, UserContextError};
 use crate::memory::{self, AddressSpace};
 use crate::sync::Mutex;
+use crate::tasking::fd::{self, FileDescriptor, MAX_FDS};
 use alloc::boxed::Box;
 use alloc::vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,11 +13,21 @@ const KERNEL_STACK_SIZE: usize = 64 * 1024;
 pub type KernelTaskEntry = fn();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FdMapping {
+    pub source: usize,
+    pub target: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskId(u64);
 
 impl TaskId {
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    pub const fn from_raw(value: u64) -> Self {
+        Self(value)
     }
 }
 
@@ -32,7 +43,9 @@ pub enum TaskState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TaskInfo {
     pub id: TaskId,
+    pub parent: Option<TaskId>,
     pub state: TaskState,
+    pub exit_code: Option<u64>,
     pub is_idle: bool,
     pub is_user: bool,
 }
@@ -67,6 +80,7 @@ impl CpuContext {
 
 struct Task {
     id: TaskId,
+    parent: Option<TaskId>,
     state: TaskState,
     exit_code: Option<u64>,
     context: CpuContext,
@@ -76,11 +90,34 @@ struct Task {
     stack_top: Option<VirtAddr>,
     wake_at: Option<u64>,
     is_idle: bool,
+    fds: [Option<FileDescriptor>; MAX_FDS],
 }
 
 struct UserTask {
     address_space: AddressSpace,
     context: UserContext,
+    syscall_user_rsp: u64,
+}
+
+fn save_current_user_rsp(scheduler: &mut Scheduler, current: usize) {
+    if let Some(user) = scheduler.tasks[current]
+        .as_mut()
+        .and_then(|task| task.user.as_mut())
+    {
+        user.syscall_user_rsp = unsafe { crate::arch::syscall::user_rsp() };
+    }
+}
+
+fn find_free_fd_pair<T>(fds: &[Option<T>; MAX_FDS]) -> Option<(usize, usize)> {
+    let mut free_fds = fds
+        .iter()
+        .enumerate()
+        .filter_map(|(index, fd)| fd.is_none().then_some(index));
+    Some((free_fds.next()?, free_fds.next()?))
+}
+
+fn find_free_fd<T>(fds: &[Option<T>; MAX_FDS]) -> Option<usize> {
+    fds.iter().position(Option::is_none)
 }
 
 pub struct Scheduler {
@@ -101,10 +138,14 @@ impl Scheduler {
     }
 
     pub fn create_task(&mut self, context: CpuContext) -> Result<TaskId, SchedulerError> {
-        self.insert_task(context, None, None, None, None)
+        self.insert_task(context, None, None, None, None, None)
     }
 
-    fn create_kernel_task(&mut self, entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
+    fn create_kernel_task(
+        &mut self,
+        entry: KernelTaskEntry,
+        parent: Option<TaskId>,
+    ) -> Result<TaskId, SchedulerError> {
         // Fail before allocating the kernel stack. In particular, a full task
         // table must return `Full` even when the allocator is exhausted.
         self.check_task_capacity()?;
@@ -113,13 +154,23 @@ impl Scheduler {
             .ok_or(SchedulerError::TaskIdExhausted)?;
 
         let (context, stack, stack_top) = create_task_stack()?;
-        self.insert_task(context, Some(entry), None, Some(stack), Some(stack_top))
+        self.insert_task(
+            context,
+            parent,
+            Some(entry),
+            None,
+            Some(stack),
+            Some(stack_top),
+        )
     }
 
     fn create_user_task(
         &mut self,
         address_space: &mut Option<AddressSpace>,
         context: UserContext,
+        parent: Option<TaskId>,
+        fd_mappings: &[FdMapping],
+        fd_closes: &[usize],
     ) -> Result<TaskId, SchedulerError> {
         self.check_task_capacity()?;
         let next_id = self
@@ -128,6 +179,44 @@ impl Scheduler {
             .ok_or(SchedulerError::TaskIdExhausted)?;
         let (cpu_context, stack, stack_top) = create_task_stack()?;
         let address_space = address_space.take().ok_or(SchedulerError::InvalidContext)?;
+        let fds = parent
+            .and_then(|parent| {
+                self.tasks
+                    .iter()
+                    .flatten()
+                    .find(|task| task.id == parent)
+                    .map(|task| task.fds.clone())
+            })
+            .unwrap_or_else(fd::initial_table);
+        let mut fds = fds;
+        for mapping in fd_mappings {
+            if mapping.source >= MAX_FDS || mapping.target >= MAX_FDS {
+                return Err(SchedulerError::InvalidFd);
+            }
+            let descriptor = fds[mapping.source]
+                .as_ref()
+                .cloned()
+                .ok_or(SchedulerError::InvalidFd)?;
+            if let Some(previous) = fds[mapping.target].take() {
+                fd::close(previous);
+            }
+            fds[mapping.target] = Some(descriptor);
+        }
+        for mapping in fd_mappings {
+            if mapping.source != mapping.target
+                && let Some(descriptor) = fds[mapping.source].take()
+            {
+                fd::close(descriptor);
+            }
+        }
+        for fd_number in fd_closes {
+            if *fd_number >= MAX_FDS {
+                return Err(SchedulerError::InvalidFd);
+            }
+            if let Some(descriptor) = fds[*fd_number].take() {
+                fd::close(descriptor);
+            }
+        }
         let slot = self
             .check_task_capacity()
             .expect("reserved user task slot remains available");
@@ -135,6 +224,7 @@ impl Scheduler {
         self.next_id = next_id;
         self.tasks[slot] = Some(Task {
             id,
+            parent,
             state: TaskState::Ready,
             exit_code: None,
             context: cpu_context,
@@ -142,11 +232,13 @@ impl Scheduler {
             user: Some(UserTask {
                 address_space,
                 context,
+                syscall_user_rsp: 0,
             }),
             _stack: Some(stack),
             stack_top: Some(stack_top),
             wake_at: None,
             is_idle: false,
+            fds,
         });
         Ok(id)
     }
@@ -161,6 +253,7 @@ impl Scheduler {
     fn insert_task(
         &mut self,
         context: CpuContext,
+        parent: Option<TaskId>,
         entry: Option<KernelTaskEntry>,
         user: Option<UserTask>,
         stack: Option<Box<[u64]>>,
@@ -174,6 +267,7 @@ impl Scheduler {
             .ok_or(SchedulerError::TaskIdExhausted)?;
         self.tasks[slot] = Some(Task {
             id,
+            parent,
             state: TaskState::Ready,
             exit_code: None,
             context,
@@ -183,6 +277,7 @@ impl Scheduler {
             stack_top,
             wake_at: None,
             is_idle: false,
+            fds: fd::initial_table(),
         });
         Ok(id)
     }
@@ -281,6 +376,35 @@ impl Scheduler {
         Ok(())
     }
 
+    pub fn terminate_task(&mut self, id: TaskId, exit_code: u64) -> Result<(), SchedulerError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.as_ref().is_some_and(|task| task.id == id))
+            .ok_or(SchedulerError::UnknownTask)?;
+        if self.current == Some(index) {
+            return Err(SchedulerError::InvalidState);
+        }
+        let task = self.tasks[index]
+            .as_mut()
+            .ok_or(SchedulerError::UnknownTask)?;
+        if task.is_idle || task.state == TaskState::Terminated {
+            return Err(SchedulerError::InvalidState);
+        }
+        task.exit_code = Some(exit_code);
+        task.state = TaskState::Terminated;
+        self.wake_parent(index);
+        Ok(())
+    }
+
+    fn wake_all_blocked(&mut self) {
+        for task in self.tasks.iter_mut().flatten() {
+            if task.state == TaskState::Blocked {
+                task.state = TaskState::Ready;
+            }
+        }
+    }
+
     pub fn save_current_context(&mut self, context: CpuContext) -> Result<(), SchedulerError> {
         let current = self.current.ok_or(SchedulerError::NotStarted)?;
         self.task_mut(current)?.context = context;
@@ -312,6 +436,46 @@ impl Scheduler {
         Ok(())
     }
 
+    fn terminated_child(
+        &self,
+        parent: TaskId,
+        child: Option<TaskId>,
+    ) -> Result<TaskId, SchedulerError> {
+        let mut matching = self.tasks.iter().flatten().filter(|task| {
+            task.parent == Some(parent) && child.is_none_or(|child_id| task.id == child_id)
+        });
+        let Some(task) = matching
+            .clone()
+            .find(|task| task.state == TaskState::Terminated)
+        else {
+            if matching.next().is_some() {
+                return Err(SchedulerError::ChildRunning);
+            }
+            return Err(if child.is_some() {
+                SchedulerError::UnknownTask
+            } else {
+                SchedulerError::NoChild
+            });
+        };
+        Ok(task.id)
+    }
+
+    fn wake_parent(&mut self, child_index: usize) {
+        let parent = self.tasks[child_index]
+            .as_ref()
+            .and_then(|task| task.parent);
+        if let Some(parent) = parent
+            && let Some(task) = self
+                .tasks
+                .iter_mut()
+                .flatten()
+                .find(|task| task.id == parent)
+            && task.state == TaskState::Blocked
+        {
+            task.state = TaskState::Ready;
+        }
+    }
+
     pub fn current_task(&self) -> Option<TaskId> {
         self.current
             .and_then(|index| self.tasks[index].as_ref().map(|task| task.id))
@@ -331,7 +495,9 @@ impl Scheduler {
             if let Some(task) = task {
                 *entry = Some(TaskInfo {
                     id: task.id,
+                    parent: task.parent,
                     state: task.state,
+                    exit_code: task.exit_code,
                     is_idle: task.is_idle,
                     is_user: task.user.is_some(),
                 });
@@ -392,6 +558,13 @@ pub enum SchedulerError {
     InvalidUserContext(UserContextError),
     AddressSpaceCleanup,
     TaskIdExhausted,
+    InvalidFd,
+    WouldBlock,
+    BrokenPipe,
+    Io,
+    NoChild,
+    ChildRunning,
+    NotChild,
 }
 
 static GLOBAL_SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
@@ -496,6 +669,7 @@ fn activate_task_address_space(scheduler: &Scheduler, index: Option<usize>) {
         unsafe {
             crate::arch::syscall::initialize(task.stack_top.expect("user task has no kernel stack"))
         };
+        unsafe { crate::arch::syscall::set_user_rsp(user.syscall_user_rsp) };
         unsafe { user.address_space.activate() }.expect("activate selected user address space");
     } else {
         unsafe { memory::activate_kernel_address_space() }
@@ -521,6 +695,26 @@ pub fn spawn_user_with_arguments(
     argument_count: u64,
     argument_vector: VirtAddr,
 ) -> Result<TaskId, SchedulerError> {
+    spawn_user_with_arguments_and_fds(
+        address_space,
+        entry,
+        stack,
+        argument_count,
+        argument_vector,
+        &[],
+        &[],
+    )
+}
+
+pub fn spawn_user_with_arguments_and_fds(
+    address_space: AddressSpace,
+    entry: VirtAddr,
+    stack: VirtAddr,
+    argument_count: u64,
+    argument_vector: VirtAddr,
+    fd_mappings: &[FdMapping],
+    fd_closes: &[usize],
+) -> Result<TaskId, SchedulerError> {
     let mut address_space = Some(address_space);
     let context = match UserContext::for_address_space_with_arguments(
         address_space.as_ref().expect("user address space missing"),
@@ -538,12 +732,13 @@ pub fn spawn_user_with_arguments(
 
     let result = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
+        let parent = scheduler.current_task();
         if scheduler.idle_index.is_none()
             && scheduler.tasks.iter().filter(|slot| slot.is_none()).count() <= 1
         {
             Err(SchedulerError::Full)
         } else {
-            scheduler.create_user_task(&mut address_space, context)
+            scheduler.create_user_task(&mut address_space, context, parent, fd_mappings, fd_closes)
         }
     };
     if result.is_err() {
@@ -563,7 +758,8 @@ fn spawn_into(scheduler: &mut Scheduler, entry: KernelTaskEntry) -> Result<TaskI
     {
         return Err(SchedulerError::Full);
     }
-    scheduler.create_kernel_task(entry)
+    let parent = scheduler.current_task();
+    scheduler.create_kernel_task(entry, parent)
 }
 
 pub fn run_tasks() -> Result<(), SchedulerError> {
@@ -571,7 +767,7 @@ pub fn run_tasks() -> Result<(), SchedulerError> {
     let next_context = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         if scheduler.idle_index.is_none() {
-            let id = scheduler.create_kernel_task(idle_task_entry)?;
+            let id = scheduler.create_kernel_task(idle_task_entry, None)?;
             let index = scheduler
                 .tasks
                 .iter()
@@ -617,6 +813,7 @@ pub fn yield_now() -> Result<(), SchedulerError> {
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        save_current_user_rsp(&mut scheduler, current);
         scheduler.transition_current(TaskState::Ready)?;
         let next = scheduler.current.ok_or(SchedulerError::NoRunnableTasks)?;
         activate_task_address_space(&scheduler, Some(next));
@@ -683,6 +880,7 @@ pub fn block_now() -> Result<(), SchedulerError> {
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        save_current_user_rsp(&mut scheduler, current);
 
         match scheduler.transition_current(TaskState::Blocked) {
             Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
@@ -723,6 +921,7 @@ pub fn sleep_ticks(duration: u64) -> Result<(), SchedulerError> {
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        save_current_user_rsp(&mut scheduler, current);
         match scheduler.sleep_current_until(deadline) {
             Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
             Err(error) => return Err(error),
@@ -795,6 +994,16 @@ pub fn wake_task(id: TaskId) -> Result<(), SchedulerError> {
     GLOBAL_SCHEDULER.lock().wake(id)
 }
 
+/// Terminate a non-running task from kernel control code.
+pub fn terminate_task(id: TaskId, exit_code: u64) -> Result<(), SchedulerError> {
+    GLOBAL_SCHEDULER.lock().terminate_task(id, exit_code)
+}
+
+/// Wake tasks waiting for descriptor activity or another external event.
+pub fn wake_all_blocked_tasks() {
+    GLOBAL_SCHEDULER.lock().wake_all_blocked();
+}
+
 /// Return whether the currently executing scheduled task is a user task.
 pub fn current_task_is_user() -> bool {
     let scheduler = GLOBAL_SCHEDULER.lock();
@@ -857,15 +1066,47 @@ pub fn exit_current_with_code(exit_code: u64) -> ! {
     exit_current_with_status(Some(exit_code))
 }
 
+/// Terminate the current user task and its sibling tasks created by the same
+/// shell pipeline.
+pub fn exit_current_group_with_code(exit_code: u64) -> ! {
+    exit_current_with_status_and_group(Some(exit_code), true)
+}
+
 fn exit_current_with_status(exit_code: Option<u64>) -> ! {
+    exit_current_with_status_and_group(exit_code, false)
+}
+
+fn exit_current_with_status_and_group(exit_code: Option<u64>, terminate_group: bool) -> ! {
     let _interrupt_guard = InterruptGuard::new();
     let (old_context, next_context) = {
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.expect("task exit without current task");
+        save_current_user_rsp(&mut scheduler, current);
+        if terminate_group {
+            let parent = scheduler.tasks[current]
+                .as_ref()
+                .and_then(|task| task.parent);
+            if let Some(parent) = parent {
+                for (index, task) in scheduler.tasks.iter_mut().enumerate() {
+                    if index != current
+                        && task
+                            .as_ref()
+                            .is_some_and(|task| task.parent == Some(parent))
+                    {
+                        let task = task.as_mut().expect("sibling task slot is empty");
+                        if task.state != TaskState::Terminated {
+                            task.exit_code = exit_code;
+                            task.state = TaskState::Terminated;
+                        }
+                    }
+                }
+            }
+        }
         scheduler.tasks[current]
             .as_mut()
             .expect("current task slot is empty")
             .exit_code = exit_code;
+        scheduler.wake_parent(current);
 
         match scheduler.transition_current(TaskState::Terminated) {
             Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
@@ -897,6 +1138,221 @@ fn exit_current_with_status(exit_code: Option<u64>) -> ! {
 
 pub fn task_state(id: TaskId) -> Result<TaskState, SchedulerError> {
     GLOBAL_SCHEDULER.lock().task_state(id)
+}
+
+pub fn task_parent(id: TaskId) -> Result<Option<TaskId>, SchedulerError> {
+    GLOBAL_SCHEDULER.lock().task(id).map(|task| task.parent)
+}
+
+pub fn read_current_fd(fd_number: usize, output: &mut [u8]) -> Result<usize, SchedulerError> {
+    let scheduler = GLOBAL_SCHEDULER.lock();
+    let task = scheduler
+        .current
+        .and_then(|index| scheduler.tasks[index].as_ref())
+        .ok_or(SchedulerError::NotStarted)?;
+    let descriptor = task
+        .fds
+        .get(fd_number)
+        .and_then(Option::as_ref)
+        .ok_or(SchedulerError::InvalidFd)?;
+    fd::read(descriptor, output).map_err(|error| match error {
+        fd::ReadError::Invalid => SchedulerError::InvalidFd,
+        fd::ReadError::WouldBlock => SchedulerError::WouldBlock,
+        fd::ReadError::Io => SchedulerError::Io,
+    })
+}
+
+pub fn write_current_fd(fd_number: usize, input: &[u8]) -> Result<usize, SchedulerError> {
+    let scheduler = GLOBAL_SCHEDULER.lock();
+    let task = scheduler
+        .current
+        .and_then(|index| scheduler.tasks[index].as_ref())
+        .ok_or(SchedulerError::NotStarted)?;
+    let descriptor = task
+        .fds
+        .get(fd_number)
+        .and_then(Option::as_ref)
+        .ok_or(SchedulerError::InvalidFd)?;
+    fd::write(descriptor, input).map_err(|error| match error {
+        fd::WriteError::Invalid => SchedulerError::InvalidFd,
+        fd::WriteError::WouldBlock => SchedulerError::WouldBlock,
+        fd::WriteError::BrokenPipe => SchedulerError::BrokenPipe,
+        fd::WriteError::Io => SchedulerError::Io,
+    })
+}
+
+pub fn create_file_write_for_current(path: &str) -> Result<usize, SchedulerError> {
+    let _interrupt_guard = InterruptGuard::new();
+    let file_fd = {
+        let scheduler = GLOBAL_SCHEDULER.lock();
+        let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        let task = scheduler.tasks[current]
+            .as_ref()
+            .ok_or(SchedulerError::UnknownTask)?;
+        find_free_fd(&task.fds).ok_or(SchedulerError::Full)?
+    };
+    let descriptor = fd::create_file_write(path).map_err(|_| SchedulerError::Io)?;
+    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+    let task = scheduler.tasks[current]
+        .as_mut()
+        .ok_or(SchedulerError::UnknownTask)?;
+    if task.fds[file_fd].is_some() {
+        return Err(SchedulerError::Full);
+    }
+    task.fds[file_fd] = Some(descriptor);
+    Ok(file_fd)
+}
+
+pub fn create_file_read_for_current(path: &str) -> Result<usize, SchedulerError> {
+    let _interrupt_guard = InterruptGuard::new();
+    let file_fd = {
+        let scheduler = GLOBAL_SCHEDULER.lock();
+        let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        let task = scheduler.tasks[current]
+            .as_ref()
+            .ok_or(SchedulerError::UnknownTask)?;
+        find_free_fd(&task.fds).ok_or(SchedulerError::Full)?
+    };
+    let descriptor = fd::create_file_read(path).map_err(|_| SchedulerError::Io)?;
+    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+    let task = scheduler.tasks[current]
+        .as_mut()
+        .ok_or(SchedulerError::UnknownTask)?;
+    if task.fds[file_fd].is_some() {
+        return Err(SchedulerError::Full);
+    }
+    task.fds[file_fd] = Some(descriptor);
+    Ok(file_fd)
+}
+
+pub fn create_pipe_for_current() -> Result<(usize, usize), SchedulerError> {
+    let (read_end, write_end) = fd::create_pipe().ok_or(SchedulerError::Full)?;
+    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+    let task = scheduler.tasks[current]
+        .as_mut()
+        .ok_or(SchedulerError::UnknownTask)?;
+    let (read_fd, write_fd) = find_free_fd_pair(&task.fds).ok_or(SchedulerError::Full)?;
+    task.fds[read_fd] = Some(read_end);
+    task.fds[write_fd] = Some(write_end);
+    Ok((read_fd, write_fd))
+}
+
+pub fn close_current_fd(fd_number: usize) -> Result<(), SchedulerError> {
+    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+    let task = scheduler
+        .tasks
+        .get_mut(current)
+        .and_then(Option::as_mut)
+        .ok_or(SchedulerError::InvalidFd)?;
+    let descriptor = task
+        .fds
+        .get_mut(fd_number)
+        .and_then(Option::take)
+        .ok_or(SchedulerError::InvalidFd)?;
+    fd::close(descriptor);
+    drop(scheduler);
+    wake_all_blocked_tasks();
+    Ok(())
+}
+
+pub fn duplicate_current_fd(source_fd: usize, target_fd: usize) -> Result<(), SchedulerError> {
+    if source_fd >= MAX_FDS || target_fd >= MAX_FDS {
+        return Err(SchedulerError::InvalidFd);
+    }
+    if source_fd == target_fd {
+        let scheduler = GLOBAL_SCHEDULER.lock();
+        let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+        if scheduler.tasks[current]
+            .as_ref()
+            .and_then(|task| task.fds[source_fd].as_ref())
+            .is_some()
+        {
+            return Ok(());
+        }
+        return Err(SchedulerError::InvalidFd);
+    }
+
+    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+    let task = scheduler
+        .tasks
+        .get_mut(current)
+        .and_then(Option::as_mut)
+        .ok_or(SchedulerError::InvalidFd)?;
+    let duplicate = task.fds[source_fd]
+        .as_ref()
+        .cloned()
+        .ok_or(SchedulerError::InvalidFd)?;
+    if let Some(previous) = task.fds[target_fd].take() {
+        fd::close(previous);
+    }
+    task.fds[target_fd] = Some(duplicate);
+    Ok(())
+}
+
+/// Wait for one of the current task's children to terminate, then reap it.
+///
+/// Supplying a child ID restricts the wait to that child. The child must have
+/// been created by the calling task; unrelated tasks cannot be waited on.
+pub fn wait_for_child(child: Option<TaskId>) -> Result<(TaskId, Option<u64>), SchedulerError> {
+    loop {
+        let _interrupt_guard = InterruptGuard::new();
+        let (old_context, next_context) = {
+            let mut scheduler = GLOBAL_SCHEDULER.lock();
+            let current = scheduler.current.ok_or(SchedulerError::NotStarted)?;
+            let parent = scheduler.tasks[current]
+                .as_ref()
+                .ok_or(SchedulerError::UnknownTask)?
+                .id;
+
+            if let Some(child_id) = child {
+                let child_task = scheduler.task(child_id)?;
+                if child_task.parent != Some(parent) {
+                    return Err(SchedulerError::NotChild);
+                }
+            }
+
+            match scheduler.terminated_child(parent, child) {
+                Ok(child_id) => {
+                    let exit_code = scheduler.task(child_id)?.exit_code;
+                    scheduler.reap_terminated(child_id)?;
+                    return Ok((child_id, exit_code));
+                }
+                Err(SchedulerError::UnknownTask) if child.is_some() => {
+                    return Err(SchedulerError::UnknownTask);
+                }
+                Err(SchedulerError::NoChild) => return Err(SchedulerError::NoChild),
+                Err(SchedulerError::ChildRunning) | Err(SchedulerError::UnknownTask) => {}
+                Err(error) => return Err(error),
+            }
+
+            save_current_user_rsp(&mut scheduler, current);
+            scheduler.transition_current(TaskState::Blocked)?;
+            let old_context = &mut scheduler.tasks[current]
+                .as_mut()
+                .ok_or(SchedulerError::UnknownTask)?
+                .context as *mut CpuContext;
+            let next_context = match scheduler.current {
+                Some(next) => {
+                    activate_task_address_space(&scheduler, Some(next));
+                    &scheduler.tasks[next]
+                        .as_ref()
+                        .ok_or(SchedulerError::UnknownTask)?
+                        .context as *const CpuContext
+                }
+                None => {
+                    activate_task_address_space(&scheduler, None);
+                    &raw const BOOTSTRAP_CONTEXT
+                }
+            };
+            (old_context, next_context)
+        };
+        unsafe { leafos_context_switch(old_context, next_context) };
+    }
 }
 
 /// Return a terminated task's exit code, or `None` if it failed or was a kernel task.
@@ -992,7 +1448,9 @@ fn scheduler_task_snapshot_reports_current_states() {
         snapshot[0],
         Some(TaskInfo {
             id: first,
+            parent: None,
             state: TaskState::Running,
+            exit_code: None,
             is_idle: false,
             is_user: false,
         })
@@ -1001,12 +1459,26 @@ fn scheduler_task_snapshot_reports_current_states() {
         snapshot[1],
         Some(TaskInfo {
             id: second,
+            parent: None,
             state: TaskState::Ready,
+            exit_code: None,
             is_idle: false,
             is_user: false,
         })
     );
     assert!(snapshot[2..].iter().all(Option::is_none));
+}
+
+#[test_case]
+fn fd_pair_allocation_requires_two_slots_before_mutation() {
+    let mut fds = [const { None }; MAX_FDS];
+    fds[0] = Some(());
+    for slot in fds.iter_mut().skip(2) {
+        *slot = Some(());
+    }
+    assert_eq!(find_free_fd(&fds), Some(1));
+    assert_eq!(find_free_fd_pair(&fds), None);
+    assert!(fds[1].is_none());
 }
 
 #[test_case]
@@ -1030,6 +1502,30 @@ fn scheduler_blocks_wakes_and_terminates_tasks() {
         Err(SchedulerError::NoRunnableTasks)
     );
     assert_eq!(scheduler.current_task(), None);
+}
+
+#[test_case]
+fn scheduler_terminates_non_running_task_and_retains_exit_code() {
+    let mut scheduler = Scheduler::new();
+    let first = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create first task");
+    let second = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create second task");
+
+    assert_eq!(scheduler.start(), Ok(first));
+    assert_eq!(scheduler.terminate_task(second, 130), Ok(()));
+    assert_eq!(scheduler.task_state(second), Ok(TaskState::Terminated));
+    assert_eq!(
+        scheduler.task(second).map(|task| task.exit_code),
+        Ok(Some(130))
+    );
+    assert_eq!(
+        scheduler.terminate_task(first, 130),
+        Err(SchedulerError::InvalidState)
+    );
+    assert_eq!(scheduler.reap_terminated(second), Ok(()));
 }
 
 #[test_case]

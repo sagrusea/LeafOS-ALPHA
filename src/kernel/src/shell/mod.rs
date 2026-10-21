@@ -215,6 +215,7 @@ enum Command<'a> {
     InfoHardware,
     InfoSoftware,
     Processes,
+    Kill(&'a [u8]),
     Shutdown,
     Unknown,
     Empty,
@@ -322,6 +323,12 @@ fn parse_command(line: &[u8]) -> Command<'_> {
     if line.eq_ignore_ascii_case(b"ps") || line.eq_ignore_ascii_case(b"processes") {
         return Command::Processes;
     }
+    if line.eq_ignore_ascii_case(b"kill") {
+        return Command::Kill(&[]);
+    }
+    if let Some(task_id) = strip_command_arguments(line, b"kill") {
+        return Command::Kill(task_id);
+    }
     if line.eq_ignore_ascii_case(b"set") || line.eq_ignore_ascii_case(b"settings") {
         return Command::Settings;
     }
@@ -372,6 +379,7 @@ fn parse_sleep_seconds(value: &[u8]) -> Option<u64> {
     if value.is_empty() {
         return None;
     }
+
     value.iter().try_fold(0u64, |seconds, byte| {
         if !byte.is_ascii_digit() {
             return None;
@@ -382,11 +390,35 @@ fn parse_sleep_seconds(value: &[u8]) -> Option<u64> {
     })
 }
 
+fn parse_task_id(value: &[u8]) -> Option<crate::scheduler::TaskId> {
+    if value.is_empty() {
+        return None;
+    }
+    let id = value.iter().try_fold(0u64, |id, byte| {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        id.checked_mul(10)?.checked_add(u64::from(*byte - b'0'))
+    })?;
+    Some(crate::scheduler::TaskId::from_raw(id))
+}
+
 fn is_ascii_whitespace(byte: u8) -> bool {
     matches!(byte, b' ' | b'\t' | b'\n' | b'\r')
 }
 
 fn split_first_word(value: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(quote @ (b'\'' | b'"')) = value.first().copied() {
+        if let Some(end) = value[1..].iter().position(|byte| *byte == quote) {
+            let end = end + 1;
+            let rest = if end < value.len() {
+                trim_spaces(&value[end + 1..])
+            } else {
+                &[]
+            };
+            return (&value[1..end], rest);
+        }
+    }
     let separator = value
         .iter()
         .position(|byte| is_ascii_whitespace(*byte))
@@ -843,13 +875,15 @@ fn edit_disk_file(name: &str) {
 fn print_process_list() {
     let tasks = crate::scheduler::task_snapshot();
     let mut count = 0;
-    gop_println!("ID   STATE       TYPE");
+    gop_println!("ID   PARENT  STATE       EXIT  TYPE");
     for task in tasks.into_iter().flatten() {
         count += 1;
         gop_println!(
-            "{:>3}  {:<11?} {}",
+            "{:>3}  {:>6}  {:<11?} {:>4?}  {}",
             task.id.get(),
+            task.parent.map_or(0, |parent| parent.get()),
             task.state,
+            task.exit_code,
             if task.is_idle {
                 "idle"
             } else if task.is_user {
@@ -879,6 +913,12 @@ fn launch_app(
         gop_println!("App tracking is full; wait for an app to finish.");
         return;
     };
+    let (command_arguments, input_path, output_path, valid_redirects) =
+        split_redirections(command_arguments);
+    if !valid_redirects {
+        gop_println!("Usage: app [args...] [< input] [> output]");
+        return;
+    }
     let (path, raw_arguments) = split_first_word(command_arguments);
     let Ok(path) = core::str::from_utf8(path) else {
         gop_println!("Invalid app path.");
@@ -895,10 +935,9 @@ fn launch_app(
     };
     let mut arguments = [""; crate::user_program::MAX_PROGRAM_ARGUMENTS];
     let mut argument_count = 0;
-    for argument in raw_arguments
-        .split(|byte| is_ascii_whitespace(*byte))
-        .filter(|argument| !argument.is_empty())
-    {
+    let mut remaining_arguments = raw_arguments;
+    while !remaining_arguments.is_empty() {
+        let (argument, rest) = split_first_word(remaining_arguments);
         if argument_count == arguments.len() {
             gop_println!(
                 "Too many arguments (maximum {}).",
@@ -912,8 +951,85 @@ fn launch_app(
         };
         arguments[argument_count] = argument;
         argument_count += 1;
+        remaining_arguments = rest;
     }
-    let launched = if use_ext2 {
+    let launched = if input_path.is_some() || output_path.is_some() {
+        let input_fd = input_path
+            .and_then(|path| core::str::from_utf8(path).ok())
+            .and_then(|path| {
+                let mut resolved_input = [0; PATH_CAPACITY];
+                let input_len = resolve_path(current_dir, path.as_bytes(), &mut resolved_input)?;
+                let path = core::str::from_utf8(&resolved_input[..input_len]).ok()?;
+                crate::scheduler::create_file_read_for_current(path).ok()
+            });
+        if input_path.is_some() && input_fd.is_none() {
+            gop_println!("Could not open input file.");
+            return;
+        }
+        let output_fd = output_path
+            .and_then(|path| core::str::from_utf8(path).ok())
+            .and_then(|path| {
+                let mut resolved_output = [0; PATH_CAPACITY];
+                let output_len = resolve_path(current_dir, path.as_bytes(), &mut resolved_output)?;
+                let path = core::str::from_utf8(&resolved_output[..output_len]).ok()?;
+                crate::scheduler::create_file_write_for_current(path).ok()
+            });
+        if output_path.is_some() && output_fd.is_none() {
+            if let Some(input_fd) = input_fd {
+                let _ = crate::scheduler::close_current_fd(input_fd);
+            }
+            gop_println!("Could not open output file.");
+            return;
+        }
+        let mut mappings = [crate::scheduler::FdMapping {
+            source: input_fd.unwrap_or(crate::tasking::fd::STDIN),
+            target: crate::tasking::fd::STDIN,
+        }; 2];
+        let mut mapping_count = 0;
+        if let Some(input_fd) = input_fd {
+            mappings[mapping_count] = crate::scheduler::FdMapping {
+                source: input_fd,
+                target: crate::tasking::fd::STDIN,
+            };
+            mapping_count += 1;
+        }
+        if let Some(output_fd) = output_fd {
+            mappings[mapping_count] = crate::scheduler::FdMapping {
+                source: output_fd,
+                target: crate::tasking::fd::STDOUT,
+            };
+            mapping_count += 1;
+        }
+        let mut closes = [0; 2];
+        let mut close_count = 0;
+        if let Some(input_fd) = input_fd {
+            closes[close_count] = input_fd;
+            close_count += 1;
+        }
+        if let Some(output_fd) = output_fd {
+            closes[close_count] = output_fd;
+            close_count += 1;
+        }
+        let program = if use_ext2 {
+            crate::user_program::load_from_ext2_with_arguments(
+                resolved_path,
+                &arguments[..argument_count],
+            )
+        } else {
+            crate::user_program::load_with_arguments(resolved_path, &arguments[..argument_count])
+        };
+        let launched = match program {
+            Ok(program) => program.spawn_with_fd_mappings_and_closes(
+                &mappings[..mapping_count],
+                &closes[..close_count],
+            ),
+            Err(error) => Err(error),
+        };
+        for fd in closes[..close_count].iter().copied() {
+            let _ = crate::scheduler::close_current_fd(fd);
+        }
+        launched
+    } else if use_ext2 {
         crate::user_program::launch_from_ext2_with_arguments(
             resolved_path,
             &arguments[..argument_count],
@@ -932,7 +1048,238 @@ fn launch_app(
             });
             gop_println!("Started {} as user task {}.", resolved_path, task.get());
         }
+
         Err(error) => gop_println!("Could not start app: {:?}", error),
+    }
+}
+
+fn split_redirections(command: &[u8]) -> (&[u8], Option<&[u8]>, Option<&[u8]>, bool) {
+    let Some(separator) = command
+        .iter()
+        .position(|byte| *byte == b'<' || *byte == b'>')
+    else {
+        return (command, None, None, true);
+    };
+    let command_part = trim_spaces(&command[..separator]);
+    let mut remainder = trim_spaces(&command[separator..]);
+    let mut input_path = None;
+    let mut output_path = None;
+    while !remainder.is_empty() {
+        let operator = remainder[0];
+        if operator != b'<' && operator != b'>' {
+            return (command_part, None, None, false);
+        }
+        remainder = trim_spaces(&remainder[1..]);
+        let (path, extra) = split_first_word(remainder);
+        if path.is_empty() {
+            return (command_part, None, None, false);
+        }
+        if operator == b'<' {
+            if input_path.is_some() {
+                return (command_part, None, None, false);
+            }
+            input_path = Some(path);
+        } else {
+            if output_path.is_some() {
+                return (command_part, None, None, false);
+            }
+            output_path = Some(path);
+        }
+        remainder = trim_spaces(extra);
+    }
+    (command_part, input_path, output_path, true)
+}
+
+fn launch_pipeline(
+    line: &[u8],
+    current_dir: &[u8],
+    current_dir_is_ext2: bool,
+    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+) {
+    let Some(separator) = line.iter().position(|byte| *byte == b'|') else {
+        return;
+    };
+    let left = trim_spaces(&line[..separator]);
+    let right = trim_spaces(&line[separator + 1..]);
+    let (left, left_use_ext2) = pipeline_command(left, current_dir_is_ext2);
+    let (right, right_use_ext2) = pipeline_command(right, current_dir_is_ext2);
+    let (left, input_path, left_output, left_valid) = split_redirections(left);
+    let (right, right_input, output_path, right_valid) = split_redirections(right);
+    if left_output.is_some() || right_input.is_some() || !left_valid || !right_valid {
+        gop_println!("Usage: [app] [< input] | [app] [> output]");
+        return;
+    }
+    if left.is_empty() || right.is_empty() {
+        gop_println!("Usage: run <app> [args...] | run <app> [args...]");
+        return;
+    }
+    let Some(first_slot) = running_apps.iter().position(Option::is_none) else {
+        gop_println!("App tracking is full; wait for an app to finish.");
+        return;
+    };
+    let Some(second_slot) = running_apps
+        .iter()
+        .enumerate()
+        .skip(first_slot + 1)
+        .find_map(|(index, slot)| slot.is_none().then_some(index))
+    else {
+        gop_println!("App tracking needs two free slots.");
+        return;
+    };
+    let (read_fd, write_fd) = match crate::scheduler::create_pipe_for_current() {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            gop_println!("Could not create pipeline: {:?}", error);
+            return;
+        }
+    };
+    let input_fd = input_path
+        .and_then(|path| core::str::from_utf8(path).ok())
+        .and_then(|path| {
+            let mut resolved = [0; PATH_CAPACITY];
+            let length = resolve_path(current_dir, path.as_bytes(), &mut resolved)?;
+            let path = core::str::from_utf8(&resolved[..length]).ok()?;
+            crate::scheduler::create_file_read_for_current(path).ok()
+        });
+    if input_path.is_some() && input_fd.is_none() {
+        gop_println!("Could not open input file.");
+        let _ = crate::scheduler::close_current_fd(read_fd);
+        let _ = crate::scheduler::close_current_fd(write_fd);
+        return;
+    }
+    let spawn = |spec: &[u8],
+                 use_ext2: bool,
+                 mappings: &[crate::scheduler::FdMapping],
+                 close_fds: &[usize]| {
+        let (path, raw_arguments) = split_first_word(spec);
+        let path = core::str::from_utf8(path).ok()?;
+        let mut resolved = [0; PATH_CAPACITY];
+        let path_len = resolve_path(current_dir, path.as_bytes(), &mut resolved)?;
+        let resolved_path = core::str::from_utf8(&resolved[..path_len]).ok()?;
+        let mut arguments = [""; crate::user_program::MAX_PROGRAM_ARGUMENTS];
+        let mut argument_count = 0;
+        let mut remaining_arguments = raw_arguments;
+        while !remaining_arguments.is_empty() {
+            let (argument, rest) = split_first_word(remaining_arguments);
+            if argument_count == arguments.len() {
+                return None;
+            }
+            arguments[argument_count] = core::str::from_utf8(argument).ok()?;
+            argument_count += 1;
+            remaining_arguments = rest;
+        }
+        let program = if use_ext2 {
+            crate::user_program::load_from_ext2_with_arguments(
+                resolved_path,
+                &arguments[..argument_count],
+            )
+        } else {
+            crate::user_program::load_with_arguments(resolved_path, &arguments[..argument_count])
+        }
+        .ok()?;
+        let task = program
+            .spawn_with_fd_mappings_and_closes(mappings, close_fds)
+            .ok()?;
+        Some((task, resolved, path_len))
+    };
+    let output_fd = output_path
+        .and_then(|path| core::str::from_utf8(path).ok())
+        .and_then(|path| {
+            let mut resolved = [0; PATH_CAPACITY];
+            let length = resolve_path(current_dir, path.as_bytes(), &mut resolved)?;
+            let path = core::str::from_utf8(&resolved[..length]).ok()?;
+            crate::scheduler::create_file_write_for_current(path).ok()
+        });
+    if output_path.is_some() && output_fd.is_none() {
+        gop_println!("Could not open output file.");
+        let _ = crate::scheduler::close_current_fd(read_fd);
+        let _ = crate::scheduler::close_current_fd(write_fd);
+        return;
+    }
+    let first_mappings = [
+        crate::scheduler::FdMapping {
+            source: input_fd.unwrap_or(crate::tasking::fd::STDIN),
+            target: crate::tasking::fd::STDIN,
+        },
+        crate::scheduler::FdMapping {
+            source: write_fd,
+            target: crate::tasking::fd::STDOUT,
+        },
+    ];
+    let first_mappings = if input_fd.is_some() {
+        &first_mappings[..]
+    } else {
+        &first_mappings[1..]
+    };
+    let first_closes = if let Some(input_fd) = input_fd {
+        [read_fd, input_fd]
+    } else {
+        [read_fd, write_fd]
+    };
+    let first = spawn(left, left_use_ext2, first_mappings, &first_closes);
+    let second_mappings = [
+        crate::scheduler::FdMapping {
+            source: read_fd,
+            target: crate::tasking::fd::STDIN,
+        },
+        crate::scheduler::FdMapping {
+            source: output_fd.unwrap_or(crate::tasking::fd::STDOUT),
+            target: crate::tasking::fd::STDOUT,
+        },
+    ];
+    let second_closes = [write_fd, output_fd.unwrap_or(crate::tasking::fd::STDOUT)];
+    let second_mappings = if output_fd.is_some() {
+        &second_mappings[..]
+    } else {
+        &second_mappings[..1]
+    };
+    let second_closes = if output_fd.is_some() {
+        &second_closes[..]
+    } else {
+        &[write_fd][..]
+    };
+    let second = spawn(right, right_use_ext2, second_mappings, second_closes);
+    let _ = crate::scheduler::close_current_fd(read_fd);
+    let _ = crate::scheduler::close_current_fd(write_fd);
+    if let Some(output_fd) = output_fd {
+        let _ = crate::scheduler::close_current_fd(output_fd);
+    }
+    if let Some(input_fd) = input_fd {
+        let _ = crate::scheduler::close_current_fd(input_fd);
+    }
+    let Some((first_task, first_path, first_path_len)) = first else {
+        gop_println!("Could not start the left side of the pipeline.");
+        return;
+    };
+    let Some((second_task, second_path, second_path_len)) = second else {
+        gop_println!("Could not start the right side of the pipeline.");
+        return;
+    };
+    running_apps[first_slot] = Some(RunningApp {
+        task: first_task,
+        path: first_path,
+        path_len: first_path_len,
+    });
+    running_apps[second_slot] = Some(RunningApp {
+        task: second_task,
+        path: second_path,
+        path_len: second_path_len,
+    });
+    gop_println!(
+        "Started pipeline as user tasks {} and {}.",
+        first_task.get(),
+        second_task.get()
+    );
+}
+
+fn pipeline_command<'a>(command: &'a [u8], current_dir_is_ext2: bool) -> (&'a [u8], bool) {
+    let (name, arguments) = split_first_word(command);
+    if name.eq_ignore_ascii_case(b"run") {
+        (trim_spaces(arguments), current_dir_is_ext2)
+    } else if name.eq_ignore_ascii_case(b"diskrun") {
+        (trim_spaces(arguments), true)
+    } else {
+        (command, true)
     }
 }
 
@@ -952,6 +1299,7 @@ fn report_finished_apps(
                 if !finished_any {
                     crate::framebuffer::finish_input_line();
                 }
+
                 let path = core::str::from_utf8(&app.path[..app.path_len])
                     .expect("shell app path is valid UTF-8");
                 match crate::scheduler::task_exit_code(app.task) {
@@ -994,6 +1342,24 @@ fn report_finished_apps(
         print_prompt(current_dir, current_dir_is_ext2);
         redraw_command_line(line);
     }
+}
+
+fn interrupt_running_apps(
+    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+) -> bool {
+    let mut interrupted = false;
+    for app in running_apps.iter().flatten() {
+        match crate::scheduler::terminate_task(app.task, 130) {
+            Ok(()) => interrupted = true,
+            Err(crate::scheduler::SchedulerError::InvalidState) => {}
+            Err(error) => gop_println!(
+                "Could not interrupt app task {}: {:?}",
+                app.task.get(),
+                error
+            ),
+        }
+    }
+    interrupted
 }
 
 fn print_hardware_info() {
@@ -1056,6 +1422,15 @@ fn execute(
     current_dir_is_ext2: &mut bool,
     running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
 ) {
+    if line.contains(&b'|') {
+        launch_pipeline(
+            line,
+            &current_dir[..*current_dir_len],
+            *current_dir_is_ext2,
+            running_apps,
+        );
+        return;
+    }
     match parse_command(line) {
         Command::Help => {
             gop_println!("Common commands:");
@@ -1078,6 +1453,8 @@ fn execute(
             gop_println!("  edit <path>              Edit a UTF-8 text file on the ext2 disk");
             gop_println!("  run <app> [args...]       Start an app from the current filesystem");
             gop_println!("  diskrun <app> [args...]   Start an app from the ext2 data disk");
+            gop_println!("  app ... > <path>          Redirect app stdout to an ext2 file");
+            gop_println!("  app ... < <path>          Read app stdin from an ext2 file");
             gop_println!("  Up/Down                  Browse command history");
             gop_println!("  PageUp/PageDown          Scroll terminal output; Esc returns");
             gop_println!("  Left/Right, Home/End     Edit the command line");
@@ -1085,6 +1462,7 @@ fn execute(
             gop_println!("  set res <w>:<h>          Check the requested resolution");
             gop_println!("  info [ -os | -hw | -sw ] Show detailed system information");
             gop_println!("  ps / processes          List scheduled tasks");
+            gop_println!("  kill <task-id>          Terminate a non-running task");
             gop_println!(
                 "  shutdown / sd            Power off the system - DO NOT USE (halts cpu)"
             );
@@ -1119,6 +1497,24 @@ fn execute(
             _ => gop_println!("Usage: sleep <seconds> (0-3600)"),
         },
         Command::Processes => print_process_list(),
+        Command::Kill(value) => match parse_task_id(value) {
+            Some(task_id) => match crate::scheduler::terminate_task(task_id, 143) {
+                Ok(()) => gop_println!("Terminated task {}.", task_id.get()),
+                Err(crate::scheduler::SchedulerError::InvalidState) => {
+                    gop_println!(
+                        "Task {} is running, idle, or already terminated.",
+                        task_id.get()
+                    )
+                }
+                Err(crate::scheduler::SchedulerError::UnknownTask) => {
+                    gop_println!("Unknown task {}.", task_id.get())
+                }
+                Err(error) => {
+                    gop_println!("Could not terminate task {}: {:?}", task_id.get(), error)
+                }
+            },
+            None => gop_println!("Usage: kill <task-id>"),
+        },
         Command::Run(path) if !path.is_empty() => launch_app(
             path,
             &current_dir[..*current_dir_len],
@@ -1482,7 +1878,12 @@ fn print_prompt(current_dir: &[u8], current_dir_is_ext2: bool) {
         Ok(path) => gop_print!("leafos:/{}> ", path),
         Err(_) => gop_print!("leafos:/> "),
     }
+
     crate::framebuffer::begin_input_line();
+}
+
+fn running_app_count(running_apps: &[Option<RunningApp>; crate::scheduler::MAX_TASKS]) -> usize {
+    running_apps.iter().filter(|app| app.is_some()).count()
 }
 
 pub fn run() -> ! {
@@ -1526,10 +1927,10 @@ pub fn run() -> ! {
         match key {
             Some(b'\n' | b'\r') => {
                 line.cursor = line.length;
-                redraw_command_line(&line);
                 crate::framebuffer::finish_input_line();
                 gop_println!();
                 history.record(line.as_bytes());
+                let apps_before = running_app_count(&running_apps);
                 execute(
                     line.as_bytes(),
                     &mut current_dir,
@@ -1538,7 +1939,9 @@ pub fn run() -> ! {
                     &mut running_apps,
                 );
                 line.clear();
-                print_prompt(&current_dir[..current_dir_len], current_dir_is_ext2);
+                if running_app_count(&running_apps) == apps_before {
+                    print_prompt(&current_dir[..current_dir_len], current_dir_is_ext2);
+                }
             }
             Some(0x08 | 0x7f) => {
                 if line.backspace() {
@@ -1547,10 +1950,15 @@ pub fn run() -> ! {
                 }
             }
             Some(0x03) => {
+                let interrupted = interrupt_running_apps(&mut running_apps);
                 line.clear();
                 redraw_command_line(&line);
                 crate::framebuffer::finish_input_line();
-                gop_println!("^C");
+                if interrupted {
+                    gop_println!("^C (applications interrupted)");
+                } else {
+                    gop_println!("^C");
+                }
                 print_prompt(&current_dir[..current_dir_len], current_dir_is_ext2);
             }
             Some(b'\t') => {
@@ -1701,6 +2109,17 @@ mod tests {
         assert_eq!(parse_command(b"info -sw"), Command::InfoSoftware);
         assert_eq!(parse_command(b"ps"), Command::Processes);
         assert_eq!(parse_command(b"processes"), Command::Processes);
+        assert_eq!(parse_command(b"kill 12"), Command::Kill(b"12"));
+        assert_eq!(parse_command(b"kill"), Command::Kill(b""));
+        assert_eq!(
+            parse_task_id(b"12"),
+            Some(crate::scheduler::TaskId::from_raw(12))
+        );
+        assert_eq!(
+            parse_task_id(b"0"),
+            Some(crate::scheduler::TaskId::from_raw(0))
+        );
+        assert_eq!(parse_task_id(b"12x"), None);
         assert_eq!(parse_command(b"shutdown"), Command::Shutdown);
         assert_eq!(parse_command(b"sd"), Command::Shutdown);
         assert_eq!(parse_command(b"SD"), Command::Shutdown);
@@ -1710,6 +2129,64 @@ mod tests {
         );
         assert_eq!(parse_command(b""), Command::Empty);
         assert_eq!(parse_command(b"reboot"), Command::Unknown);
+    }
+
+    #[test_case]
+    fn pipeline_commands_support_run_and_diskrun() {
+        assert_eq!(
+            pipeline_command(b"run apps/echo.app hello", false),
+            (b"apps/echo.app hello".as_slice(), false)
+        );
+        assert_eq!(
+            pipeline_command(b"run apps/echo.app hello", true),
+            (b"apps/echo.app hello".as_slice(), true)
+        );
+        assert_eq!(
+            pipeline_command(b"diskrun apps/wc.app", false),
+            (b"apps/wc.app".as_slice(), true)
+        );
+        assert_eq!(
+            pipeline_command(b"apps/cat.app", false),
+            (b"apps/cat.app".as_slice(), true)
+        );
+        assert_eq!(
+            split_first_word(b"apps/grep.app \".app\""),
+            (b"apps/grep.app".as_slice(), b"\".app\"".as_slice())
+        );
+        assert_eq!(
+            split_first_word(b"\"apps/my app.app\" pattern"),
+            (b"apps/my app.app".as_slice(), b"pattern".as_slice())
+        );
+    }
+
+    #[test_case]
+    fn redirections_split_command_and_paths() {
+        assert_eq!(
+            split_redirections(b"run apps/echo.app hello > output.txt"),
+            (
+                b"run apps/echo.app hello".as_slice(),
+                None,
+                Some(b"output.txt".as_slice()),
+                true
+            )
+        );
+        assert_eq!(
+            split_redirections(b"run apps/cat.app < input.txt > output.txt"),
+            (
+                b"run apps/cat.app".as_slice(),
+                Some(b"input.txt".as_slice()),
+                Some(b"output.txt".as_slice()),
+                true
+            )
+        );
+        assert_eq!(
+            split_redirections(b"run apps/wc.app"),
+            (b"run apps/wc.app".as_slice(), None, None, true)
+        );
+        assert_eq!(
+            split_redirections(b"run apps/wc.app >"),
+            (b"run apps/wc.app".as_slice(), None, None, false)
+        );
     }
 
     #[test_case]

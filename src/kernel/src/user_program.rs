@@ -59,12 +59,29 @@ impl LoadedProgram {
     }
 
     pub fn spawn(self) -> Result<TaskId, ProgramError> {
-        scheduler::spawn_user_with_arguments(
+        self.spawn_with_fd_mappings(&[])
+    }
+
+    pub fn spawn_with_fd_mappings(
+        self,
+        fd_mappings: &[scheduler::FdMapping],
+    ) -> Result<TaskId, ProgramError> {
+        self.spawn_with_fd_mappings_and_closes(fd_mappings, &[])
+    }
+
+    pub fn spawn_with_fd_mappings_and_closes(
+        self,
+        fd_mappings: &[scheduler::FdMapping],
+        fd_closes: &[usize],
+    ) -> Result<TaskId, ProgramError> {
+        scheduler::spawn_user_with_arguments_and_fds(
             self.address_space,
             self.entry,
             self.stack,
             self.argument_count,
             self.argument_vector,
+            fd_mappings,
+            fd_closes,
         )
         .map_err(ProgramError::Scheduler)
     }

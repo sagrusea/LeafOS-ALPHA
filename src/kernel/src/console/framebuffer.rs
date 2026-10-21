@@ -1092,6 +1092,26 @@ mod tests {
     }
 
     #[test_case]
+    fn finishing_input_line_removes_cursor_without_erasing_text() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            begin_input_line();
+            redraw_input_line(b"abcH", 3);
+            finish_input_line();
+
+            let writer = WRITER.get().unwrap().lock();
+            assert_eq!(writer.cursor_overlay, None);
+            assert_eq!(writer.input_cell_count, 0);
+            let x = MARGIN + 3 * CHAR_WIDTH;
+            let y = MARGIN;
+            let offset = y * writer.info.stride + x * writer.info.bytes_per_pixel;
+            let pixel = unsafe { writer.info.buffer.ptr.as_ptr().add(offset).read_volatile() };
+            assert_eq!(pixel, DEFAULT_FG.0);
+        });
+    }
+
+    #[test_case]
     fn editor_scrolls_the_document_and_tracks_the_visible_cursor() {
         init_test_framebuffer();
         x86_64::instructions::interrupts::without_interrupts(|| {

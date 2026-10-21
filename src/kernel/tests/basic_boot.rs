@@ -34,11 +34,26 @@ static TASKED_EXT2_DIRECTORY_CREATED: AtomicBool = AtomicBool::new(false);
 static USER_TASK_KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 static USER_TASK_DIAGNOSTICS_CONTINUED: AtomicBool = AtomicBool::new(false);
 static DYNAMIC_APP_TASK_ID: AtomicU64 = AtomicU64::new(0);
+static WAITED_APP_TASK_ID: AtomicU64 = AtomicU64::new(0);
+static WAITED_APP_EXIT_CODE: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn launch_app_from_kernel_task() {
     let task = kernel::user_program::launch("apps/smoke.app")
         .expect("launch LeafOS app while scheduler is running");
     DYNAMIC_APP_TASK_ID.store(task.get(), Ordering::SeqCst);
+}
+
+fn launch_and_wait_for_app() {
+    let child =
+        kernel::user_program::launch("apps/smoke.app").expect("launch child app from waiting task");
+    WAITED_APP_TASK_ID.store(child.get(), Ordering::SeqCst);
+    let (finished, exit_code) =
+        scheduler::wait_for_child(Some(child)).expect("wait for owned child app");
+    assert_eq!(finished, child);
+    WAITED_APP_EXIT_CODE.store(
+        exit_code.expect("child should have exit status"),
+        Ordering::SeqCst,
+    );
 }
 
 fn create_and_remove_ext2_directory_task() {
@@ -91,6 +106,20 @@ fn run_user_test_program(code: &[u8]) -> u64 {
 
 fn emit_mov_rdi_imm64(code: &mut Vec<u8>, value: u64) -> usize {
     code.extend_from_slice(&[0x48, 0xbf]); // mov rdi, imm64
+    let immediate = code.len();
+    code.extend_from_slice(&value.to_le_bytes());
+    immediate
+}
+
+fn emit_mov_rsi_imm64(code: &mut Vec<u8>, value: u64) -> usize {
+    code.extend_from_slice(&[0x48, 0xbe]); // mov rsi, imm64
+    let immediate = code.len();
+    code.extend_from_slice(&value.to_le_bytes());
+    immediate
+}
+
+fn emit_mov_rdx_imm64_with_immediate(code: &mut Vec<u8>, value: u64) -> usize {
+    code.extend_from_slice(&[0x48, 0xba]); // mov rdx, imm64
     let immediate = code.len();
     code.extend_from_slice(&value.to_le_bytes());
     immediate
@@ -1260,11 +1289,39 @@ fn test_running_kernel_task_can_launch_user_app_dynamically() {
         .find(|task| task.id.get() == app_id)
         .expect("launched app task remains available for status inspection");
     assert!(app.is_user);
+    assert_eq!(
+        app.parent,
+        Some(launcher),
+        "dynamically launched apps should retain their launching task as parent"
+    );
+    assert_eq!(scheduler::task_parent(app.id), Ok(Some(launcher)));
     assert_eq!(app.state, TaskState::Terminated);
     assert_eq!(scheduler::task_exit_code(app.id), Ok(Some(42)));
 
     scheduler::reap_terminated(app.id).expect("reap dynamically launched app");
     scheduler::reap_terminated(launcher).expect("reap dynamic app launcher");
+}
+
+#[test_case]
+fn test_parent_task_can_wait_for_and_reap_owned_user_app() {
+    WAITED_APP_TASK_ID.store(0, Ordering::SeqCst);
+    WAITED_APP_EXIT_CODE.store(u64::MAX, Ordering::SeqCst);
+    let parent = scheduler::spawn(launch_and_wait_for_app).expect("spawn waiting parent task");
+
+    scheduler::run_tasks().expect("run parent and child tasks");
+
+    let child_id = WAITED_APP_TASK_ID.load(Ordering::SeqCst);
+    assert_ne!(child_id, 0);
+    assert_eq!(WAITED_APP_EXIT_CODE.load(Ordering::SeqCst), 42);
+    assert!(
+        scheduler::task_snapshot()
+            .into_iter()
+            .flatten()
+            .all(|task| task.id.get() != child_id),
+        "wait should reap the completed child"
+    );
+    assert_eq!(scheduler::task_state(parent), Ok(TaskState::Terminated));
+    scheduler::reap_terminated(parent).expect("reap waiting parent task");
 }
 
 #[test_case]
@@ -1378,6 +1435,74 @@ fn test_user_app_receives_argument_count_and_vector() {
     );
     scheduler::reap_terminated(task).expect("reap argument test app");
     ext2::remove_file("apps/ARGS.bin").expect("remove argument ABI test program");
+}
+
+#[test_case]
+fn test_user_app_can_spawn_with_arguments_and_wait() {
+    use kernel::fs::ext2;
+    use kernel::memory::USER_SPACE_START;
+
+    const CHILD_CODE: &[u8] = &[
+        0xbf, 42, 0, 0, 0, // mov edi, 42
+        0xb8, 1, 0, 0, 0, // mov eax, SYS_EXIT
+        0x0f, 0x05, // syscall
+        0x0f, 0x0b, // ud2
+    ];
+    const PATH: &[u8] = b"apps/SPAWN.bin";
+    const ARGUMENT: &[u8] = b"ok\0";
+
+    ext2::write_file("apps/SPAWN.bin", CHILD_CODE).expect("write spawn child program");
+
+    let mut code = Vec::new();
+    let path_immediate = emit_mov_rdi_imm64(&mut code, 0);
+    let path_length = PATH.len() as u32;
+    emit_mov_esi_imm32(&mut code, path_length);
+    let argv_immediate = emit_mov_rdx_imm64_with_immediate(&mut code, 0);
+    emit_mov_r10d_imm32(&mut code, 1);
+    emit_syscall(
+        &mut code,
+        kernel::arch::syscall::SYS_SPAWN_WITH_ARGUMENTS as u32,
+    );
+    let child_slot = code.len();
+    code.extend_from_slice(&[0x48, 0x89, 0xc7]); // mov rdi, rax
+    let status_immediate = emit_mov_rsi_imm64(&mut code, 0);
+    emit_syscall(&mut code, kernel::arch::syscall::SYS_WAIT as u32);
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 0x00]); // cmp rax, 0
+    let failure_branch = code.len();
+    code.extend_from_slice(&[0x74, 0]); // je failure when wait returns zero
+    code.extend_from_slice(&[0x48, 0x8b, 0x06]); // mov rax, [rsi]
+    code.extend_from_slice(&[0x48, 0x83, 0xf8, 42]); // cmp rax, 42
+    let status_failure_branch = code.len();
+    code.extend_from_slice(&[0x75, 0]);
+    emit_exit_status(&mut code, 42);
+    let failure = code.len();
+    emit_exit_status(&mut code, 1);
+    let failure_displacement = failure as isize - (failure_branch + 2) as isize;
+    assert!((-128..=127).contains(&failure_displacement));
+    code[failure_branch + 1] = failure_displacement as i8 as u8;
+    let status_failure_displacement = failure as isize - (status_failure_branch + 2) as isize;
+    assert!((-128..=127).contains(&status_failure_displacement));
+    code[status_failure_branch + 1] = status_failure_displacement as i8 as u8;
+
+    let path_offset = code.len();
+    code.extend_from_slice(PATH);
+    let argv_offset = code.len();
+    code.extend_from_slice(&[0u8; 8]);
+    let argument_offset = code.len();
+    code.extend_from_slice(ARGUMENT);
+    code[path_immediate..path_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + path_offset as u64).to_le_bytes());
+    code[argv_immediate..argv_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + argv_offset as u64).to_le_bytes());
+    code[status_immediate..status_immediate + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x3000).to_le_bytes());
+    code[argv_offset..argv_offset + 8]
+        .copy_from_slice(&(USER_SPACE_START + 0x1000 + argument_offset as u64).to_le_bytes());
+    assert_eq!(code[child_slot], 0x48);
+
+    let task = run_user_test_program(&code);
+    assert_eq!(task, 42, "spawned child arguments and wait should succeed");
+    ext2::remove_file("apps/SPAWN.bin").expect("remove spawn child program");
 }
 
 #[test_case]
