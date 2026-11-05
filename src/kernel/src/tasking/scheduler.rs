@@ -1013,6 +1013,10 @@ pub fn current_task_is_user() -> bool {
         .is_some_and(|task| task.user.is_some())
 }
 
+pub fn current_task_id() -> Option<TaskId> {
+    GLOBAL_SCHEDULER.lock().current_task()
+}
+
 /// Check a user buffer against the running task's address-space metadata.
 /// The scheduler lock keeps the task and its mappings stable during the check.
 pub fn validate_current_user_range(
@@ -1082,6 +1086,11 @@ fn exit_current_with_status_and_group(exit_code: Option<u64>, terminate_group: b
         let mut scheduler = GLOBAL_SCHEDULER.lock();
         let current = scheduler.current.expect("task exit without current task");
         save_current_user_rsp(&mut scheduler, current);
+        let current_owner = scheduler.tasks[current]
+            .as_ref()
+            .map(|task| task.id.get())
+            .unwrap_or(0);
+        crate::gui::close_windows_owned(current_owner);
         if terminate_group {
             let parent = scheduler.tasks[current]
                 .as_ref()
@@ -1094,6 +1103,7 @@ fn exit_current_with_status_and_group(exit_code: Option<u64>, terminate_group: b
                             .is_some_and(|task| task.parent == Some(parent))
                     {
                         let task = task.as_mut().expect("sibling task slot is empty");
+                        crate::gui::close_windows_owned(task.id.get());
                         if task.state != TaskState::Terminated {
                             task.exit_code = exit_code;
                             task.state = TaskState::Terminated;

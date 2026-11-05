@@ -14,6 +14,7 @@ pub const PIC_2_OFFSET: u8 = PIC_1_OFFSET + 8;
 pub enum InterruptIndex {
     Timer = PIC_1_OFFSET,
     Keyboard,
+    Mouse,
 }
 
 impl InterruptIndex {
@@ -32,6 +33,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     }
     idt[InterruptIndex::Timer.as_u8()].set_handler_fn(timer_interrupt_handler);
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
+    idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
+    idt[PIC_2_OFFSET + 4].set_handler_fn(mouse_interrupt_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt
 });
@@ -76,8 +79,7 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     crate::timer::on_interrupt();
 
     unsafe {
-        PICS.lock()
-            .signal_eoi(InterruptIndex::Timer.as_u8() - PIC_1_OFFSET);
+        signal_eoi(InterruptIndex::Timer.as_u8() - PIC_1_OFFSET);
     }
 
     crate::tasking::scheduler::preempt_from_timer();
@@ -134,14 +136,16 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                 {
                     if user_task_running && byte == 0x03 {
                         unsafe {
-                            PICS.lock()
-                                .signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
+                            signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
                         }
+
                         crate::tasking::scheduler::exit_current_group_with_code(130);
                     } else if user_task_running {
+                        crate::gui::push_key(byte);
                         crate::drivers::input::enqueue(byte);
                         crate::tasking::scheduler::wake_all_blocked_tasks();
                     } else {
+                        crate::gui::push_key(byte);
                         shell::enqueue_key(byte);
                     }
                 }
@@ -170,12 +174,26 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     unsafe {
-        PICS.lock()
-            .signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
+        signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
+    }
+}
+
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::mouse::interrupt_byte();
+    unsafe {
+        signal_eoi(12);
     }
 }
 
 pub static PICS: Mutex<Pic8259> = Mutex::new(unsafe { Pic8259::new(PIC_1_OFFSET, PIC_2_OFFSET) });
+
+fn signal_eoi(interrupt_id: u8) {
+    if crate::drivers::apic::is_initialized() {
+        crate::drivers::apic::eoi();
+    } else {
+        unsafe { PICS.lock().signal_eoi(interrupt_id) };
+    }
+}
 
 #[test_case]
 fn test_breakpoint_exception() {

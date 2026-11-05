@@ -28,6 +28,15 @@ impl FramebufferBuffer {
         }
     }
 
+    pub fn xor_byte(&mut self, offset: usize, value: u8) {
+        if offset < self.size {
+            unsafe {
+                let byte = self.ptr.as_ptr().add(offset);
+                byte.write_volatile(byte.read_volatile() ^ value);
+            }
+        }
+    }
+
     pub fn write_bytes(&mut self, offset: usize, count: usize, value: u8) {
         if offset + count <= self.size {
             unsafe {
@@ -530,6 +539,47 @@ impl FramebufferWriter {
         }
     }
 
+    pub fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: (u8, u8, u8)) {
+        let start_x = x.min(self.info.width);
+        let start_y = y.min(self.info.height);
+        let end_x = x.saturating_add(width).min(self.info.width);
+        let end_y = y.saturating_add(height).min(self.info.height);
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+        if self.info.bytes_per_pixel != 4 {
+            for row in start_y..end_y {
+                for column in start_x..end_x {
+                    self.write_pixel(column, row, color.0, color.1, color.2);
+                }
+            }
+            return;
+        }
+        let packed = if self.info.bgr {
+            0xff00_0000
+                | u32::from(color.2)
+                | (u32::from(color.1) << 8)
+                | (u32::from(color.0) << 16)
+        } else {
+            0xff00_0000
+                | u32::from(color.0)
+                | (u32::from(color.1) << 8)
+                | (u32::from(color.2) << 16)
+        };
+        for row in start_y..end_y {
+            let address = self.info.buffer.addr()
+                + row * self.info.stride
+                + start_x * self.info.bytes_per_pixel;
+            let pixels = end_x - start_x;
+            unsafe {
+                let row = address as *mut u32;
+                for column in 0..pixels {
+                    row.add(column).write_volatile(packed);
+                }
+            }
+        }
+    }
+
     pub fn new_line(&mut self) {
         self.x = MARGIN;
         self.current_line_id = self.current_line_id.wrapping_add(1);
@@ -757,6 +807,13 @@ pub fn is_initialized() -> bool {
     WRITER.get().is_some()
 }
 
+pub fn dimensions() -> Option<(usize, usize)> {
+    WRITER.get().map(|writer| {
+        let writer = writer.lock();
+        (writer.info.width, writer.info.height)
+    })
+}
+
 pub fn clear() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
@@ -858,6 +915,61 @@ pub fn set_color(r: u8, g: u8, b: u8) {
     });
 }
 
+pub fn draw_rect(x: usize, y: usize, width: usize, height: usize, color: (u8, u8, u8)) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().fill_rect(x, y, width, height, color);
+        }
+    });
+}
+
+pub fn xor_rect(x: usize, y: usize, width: usize, height: usize, color: (u8, u8, u8)) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            let mut writer = writer.lock();
+            let end_y = y.saturating_add(height).min(writer.info.height);
+            let end_x = x.saturating_add(width).min(writer.info.width);
+            for row in y.min(end_y)..end_y {
+                for column in x.min(end_x)..end_x {
+                    let offset = row * writer.info.stride
+                        + column * writer.info.bytes_per_pixel;
+                    let bgr = writer.info.bgr;
+                    let buffer = &mut writer.info.buffer;
+                    let red_offset = if bgr { 2 } else { 0 };
+                    buffer.xor_byte(offset + red_offset, color.0);
+                    buffer.xor_byte(offset + 1, color.1);
+                    buffer.xor_byte(offset + if bgr { 0 } else { 2 }, color.2);
+                }
+            }
+        }
+    });
+}
+
+pub fn draw_text(x: usize, y: usize, text: &[u8], color: (u8, u8, u8)) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            let mut writer = writer.lock();
+            for (index, byte) in text.iter().copied().enumerate() {
+                let glyph = get_glyph(byte);
+                let origin_x = x.saturating_add(index.saturating_mul(CHAR_WIDTH));
+                for row in 0..8 {
+                    for column in 0..8 {
+                        if (glyph[row] >> (7 - column)) & 1 == 1 {
+                            writer.write_pixel(
+                                origin_x + column,
+                                y + row,
+                                color.0,
+                                color.1,
+                                color.2,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
@@ -893,7 +1005,7 @@ pub fn write_bytes(bytes: &[u8]) {
 
 #[macro_export]
 macro_rules! gop_print {
-    ($($arg:tt)*) => ($crate::framebuffer::_print(format_args!($($arg)*)));
+    ($($arg:tt)*) => ($crate::console::_print(format_args!($($arg)*)));
 }
 
 #[macro_export]

@@ -136,3 +136,33 @@ leafos_list_dir:
     mov eax, 16
     syscall
     ret
+
+.global leafos_gui_create_window
+.type leafos_gui_create_window, @function
+leafos_gui_create_window:
+    mov r10, rcx
+    mov eax, 17
+    syscall
+    ret
+
+.global leafos_gui_poll_event
+.type leafos_gui_poll_event, @function
+leafos_gui_poll_event:
+    mov eax, 18
+    syscall
+    ret
+
+.global leafos_gui_close_window
+.type leafos_gui_close_window, @function
+leafos_gui_close_window:
+    mov eax, 19
+    syscall
+    ret
+
+.global leafos_gui_draw_rect
+.type leafos_gui_draw_rect, @function
+leafos_gui_draw_rect:
+    mov r10, rcx
+    mov eax, 20
+    syscall
+    ret

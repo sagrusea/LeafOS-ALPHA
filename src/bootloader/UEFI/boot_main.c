@@ -233,6 +233,9 @@ typedef struct {
 
     VOID *InitrdBase;
     UINTN InitrdSize;
+
+    /* Physical address of the ACPI RSDP, captured before ExitBootServices. */
+    UINT64 AcpiRsdp;
 } BootInfo;
 
 /* ========================================================================== */
@@ -246,6 +249,44 @@ static EFI_PHYSICAL_ADDRESS gOriginalPageTableRoot = 0;
 static EFI_PHYSICAL_ADDRESS gKernelPageTableRoot = 0;
 static EFI_PHYSICAL_ADDRESS gPhysicalMemoryOffset = 0;
 static UINTN gPhysicalMemoryPml4Index = 0;
+
+static BOOLEAN GuidEqual(const EFI_GUID *Left, const EFI_GUID *Right)
+{
+    const UINT8 *A = (const UINT8 *)Left;
+    const UINT8 *B = (const UINT8 *)Right;
+    UINTN Index;
+
+    for (Index = 0; Index < sizeof(EFI_GUID); ++Index) {
+        if (A[Index] != B[Index]) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static UINT64 FindAcpiRsdp(EFI_SYSTEM_TABLE *SystemTable)
+{
+    EFI_GUID Acpi20 = ACPI_20_TABLE_GUID;
+    EFI_GUID Acpi10 = ACPI_TABLE_GUID;
+    UINT64 Legacy = 0;
+    UINTN Index;
+
+    if (!SystemTable || !SystemTable->ConfigurationTable) {
+        return 0;
+    }
+
+    for (Index = 0; Index < SystemTable->NumberOfTableEntries; ++Index) {
+        EFI_CONFIGURATION_TABLE *Entry =
+            &SystemTable->ConfigurationTable[Index];
+        if (GuidEqual(&Entry->VendorGuid, &Acpi20)) {
+            return (UINT64)(UINTN)Entry->VendorTable;
+        }
+        if (GuidEqual(&Entry->VendorGuid, &Acpi10)) {
+            Legacy = (UINT64)(UINTN)Entry->VendorTable;
+        }
+    }
+    return Legacy;
+}
 
 /* ========================================================================== */
 /*                                 HELPERS                                    */
@@ -1374,6 +1415,7 @@ EFI_STATUS EFIAPI efi_main(
     Info->Magic = BOOT_INFO_MAGIC;
     Info->Version = 2;
     Info->SystemTable = SystemTable;
+    Info->AcpiRsdp = FindAcpiRsdp(SystemTable);
     Info->KernelBase = KERNEL_BASE_ADDRESS;
     Info->KernelFileSize = KernelFileSize;
     Info->KernelReservedSize = (UINT64)KERNEL_RESERVE_PAGES * EFI_PAGE_SIZE;

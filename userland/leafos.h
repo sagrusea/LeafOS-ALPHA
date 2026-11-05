@@ -22,6 +22,10 @@ typedef long long leafos_result_t;
 #define LEAFOS_SYS_CLOSE 14
 #define LEAFOS_SYS_DUP2 15
 #define LEAFOS_SYS_LIST_DIR 16
+#define LEAFOS_SYS_GUI_CREATE_WINDOW 17
+#define LEAFOS_SYS_GUI_POLL_EVENT 18
+#define LEAFOS_SYS_GUI_CLOSE_WINDOW 19
+#define LEAFOS_SYS_GUI_DRAW_RECT 20
 
 #define LEAFOS_MAX_SYSCALL_BUFFER 4096
 #define LEAFOS_MAX_SYSCALL_PATH 255
@@ -32,6 +36,13 @@ typedef long long leafos_result_t;
 #define LEAFOS_STDIN 0
 #define LEAFOS_STDOUT 1
 #define LEAFOS_STDERR 2
+
+typedef struct {
+    leafos_u64 kind;
+    leafos_u64 x_or_key;
+    leafos_u64 y;
+    leafos_u64 buttons;
+} leafos_gui_event_t;
 
 #define LEAFOS_E2BIG (-7LL)
 #define LEAFOS_EIO (-5LL)
@@ -94,6 +105,24 @@ leafos_result_t leafos_list_dir(
     leafos_size_t path_length,
     void *buffer,
     leafos_size_t capacity
+);
+leafos_result_t leafos_gui_create_window(
+    leafos_size_t x,
+    leafos_size_t y,
+    leafos_size_t width,
+    leafos_size_t height,
+    const void *title,
+    leafos_size_t title_length
+);
+leafos_result_t leafos_gui_poll_event(void *event, leafos_size_t capacity);
+leafos_result_t leafos_gui_close_window(leafos_u64 window_id);
+leafos_result_t leafos_gui_draw_rect(
+    leafos_u64 window_id,
+    leafos_size_t x,
+    leafos_size_t y,
+    leafos_size_t width,
+    leafos_size_t height,
+    leafos_u64 rgb
 );
 
 #endif

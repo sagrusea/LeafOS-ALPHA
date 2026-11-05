@@ -47,6 +47,14 @@ pub const SYS_DUP2: u64 = 15;
 /// List ext2 directory entries as newline-separated names:
 /// `rdi=path`, `rsi=path length`, `rdx=destination`, `r10=capacity`.
 pub const SYS_LIST_DIR: u64 = 16;
+/// Create a GUI window: x, y, width, height, title pointer/length.
+pub const SYS_GUI_CREATE_WINDOW: u64 = 17;
+/// Poll one GUI event into a writable user buffer.
+pub const SYS_GUI_POLL_EVENT: u64 = 18;
+/// Close a GUI window owned by the current task.
+pub const SYS_GUI_CLOSE_WINDOW: u64 = 19;
+/// Draw a retained rectangle in an owned window.
+pub const SYS_GUI_DRAW_RECT: u64 = 20;
 
 pub const MAX_SYSCALL_BUFFER: usize = 4096;
 pub const MAX_SYSCALL_PATH: usize = 255;
@@ -106,23 +114,41 @@ pub struct SyscallFrame {
 }
 
 #[repr(C)]
-struct CpuLocal {
-    user_rsp: u64,
-    kernel_rsp: u64,
+#[derive(Clone, Copy)]
+pub struct CpuLocal {
+    pub user_rsp: u64,
+    pub kernel_rsp: u64,
 }
 
+pub const MAX_CPUS: usize = 64;
+
 #[unsafe(no_mangle)]
-static mut LEAFOS_CPU_LOCAL: CpuLocal = CpuLocal {
-    user_rsp: 0,
-    kernel_rsp: 0,
-};
+static mut LEAFOS_CPU_LOCALS: [CpuLocal; MAX_CPUS] =
+    [CpuLocal {
+        user_rsp: 0,
+        kernel_rsp: 0,
+    }; MAX_CPUS];
 
 pub(crate) unsafe fn user_rsp() -> u64 {
-    unsafe { addr_of_mut!(LEAFOS_CPU_LOCAL.user_rsp).read() }
+    let value;
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[0]",
+            out(reg) value,
+            options(nostack, preserves_flags)
+        );
+    }
+    value
 }
 
 pub(crate) unsafe fn set_user_rsp(rsp: u64) {
-    unsafe { addr_of_mut!(LEAFOS_CPU_LOCAL.user_rsp).write(rsp) };
+    unsafe {
+        core::arch::asm!(
+            "mov gs:[0], {}",
+            in(reg) rsp,
+            options(nostack, preserves_flags)
+        );
+    }
 }
 
 unsafe extern "C" {
@@ -234,7 +260,125 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         SYS_CLOSE => sys_close(frame),
         SYS_DUP2 => sys_dup2(frame),
         SYS_LIST_DIR => sys_list_dir(frame),
+        SYS_GUI_CREATE_WINDOW => sys_gui_create_window(frame),
+        SYS_GUI_POLL_EVENT => sys_gui_poll_event(frame),
+        SYS_GUI_CLOSE_WINDOW => sys_gui_close_window(frame),
+        SYS_GUI_DRAW_RECT => sys_gui_draw_rect(frame),
         _ => SYSCALL_NOT_IMPLEMENTED,
+    }
+}
+
+fn sys_gui_create_window(frame: &SyscallFrame) -> u64 {
+        const MAX_TITLE: usize = 32;
+        if frame.rdi > usize::MAX as u64
+            || frame.rsi > usize::MAX as u64
+            || frame.rdx > usize::MAX as u64
+            || frame.r10 > usize::MAX as u64
+            || frame.r9 > MAX_TITLE as u64
+        {
+            return SYS_ERR_EINVAL;
+        }
+        let title_length = frame.r9 as usize;
+        let mut title = [0u8; MAX_TITLE];
+        if title_length > 0
+            && crate::tasking::scheduler::copy_from_current_user(
+                frame.r8,
+                &mut title[..title_length],
+            )
+            .is_err()
+        {
+            return SYS_ERR_EFAULT;
+        }
+        let owner = crate::tasking::scheduler::current_task_id()
+            .map(|task| task.get())
+            .unwrap_or(0);
+        crate::gui::open_window(
+            owner,
+            frame.rdi as usize,
+            frame.rsi as usize,
+            frame.rdx as usize,
+            frame.r10 as usize,
+            &title[..title_length],
+        )
+        .map(u64::from)
+        .unwrap_or(SYS_ERR_EAGAIN)
+}
+
+fn sys_gui_poll_event(frame: &SyscallFrame) -> u64 {
+        const EVENT_SIZE: usize = 32;
+        if frame.rsi < EVENT_SIZE as u64 {
+            return SYS_ERR_EINVAL;
+        }
+        if crate::tasking::scheduler::validate_current_user_range(frame.rdi, EVENT_SIZE, true)
+            .is_err()
+        {
+            return SYS_ERR_EFAULT;
+        }
+        let owner = crate::tasking::scheduler::current_task_id()
+            .map(|task| task.get())
+            .unwrap_or(0);
+        let Some(event) = crate::gui::poll_event(owner) else {
+            return SYS_ERR_EAGAIN;
+        };
+        let mut output = [0u8; EVENT_SIZE];
+        match event {
+            crate::gui::GuiEvent::Key(byte) => {
+                output[0] = 1;
+                output[8] = byte;
+            }
+            crate::gui::GuiEvent::Mouse { x, y, buttons } => {
+                output[0] = 2;
+                output[8..16].copy_from_slice(&i64::from(x).to_le_bytes());
+                output[16..24].copy_from_slice(&i64::from(y).to_le_bytes());
+                output[24] = buttons;
+            }
+        }
+        crate::tasking::scheduler::copy_to_current_user(frame.rdi, &output)
+            .map(|_| 0)
+            .unwrap_or(SYS_ERR_EFAULT)
+}
+
+fn sys_gui_close_window(frame: &SyscallFrame) -> u64 {
+    let owner = crate::tasking::scheduler::current_task_id()
+        .map(|task| task.get())
+        .unwrap_or(0);
+    if crate::gui::close_window_owned(frame.rdi as u32, owner) {
+        0
+    } else {
+        SYS_ERR_EINVAL
+    }
+}
+
+fn sys_gui_draw_rect(frame: &SyscallFrame) -> u64 {
+    if frame.rdi > u32::MAX as u64
+        || frame.rsi > usize::MAX as u64
+        || frame.rdx > usize::MAX as u64
+        || frame.r10 > usize::MAX as u64
+        || frame.r8 > usize::MAX as u64
+        || frame.r9 > 0x00ff_ffff
+    {
+        return SYS_ERR_EINVAL;
+    }
+    let owner = crate::tasking::scheduler::current_task_id()
+        .map(|task| task.get())
+        .unwrap_or(0);
+    let color = (
+        ((frame.r9 >> 16) & 0xff) as u8,
+        ((frame.r9 >> 8) & 0xff) as u8,
+        (frame.r9 & 0xff) as u8,
+    );
+    if crate::gui::draw_window_rect(
+        owner,
+        frame.rdi as u32,
+        frame.rsi as usize,
+        frame.rdx as usize,
+        frame.r10 as usize,
+        frame.r8 as usize,
+        color,
+    ) {
+        0
+    } else {
+        SYS_ERR_EINVAL
     }
 }
 
@@ -760,12 +904,11 @@ extern "C" fn leafos_invalid_syscall_return() -> ! {
 /// this whenever it selects a user task so its TSS and syscall stack are set.
 pub unsafe fn initialize(kernel_stack_top: VirtAddr) {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let kernel_gs_base = addr_of_mut!(LEAFOS_CPU_LOCAL) as u64;
         let user_code_base = u64::from(gdt::user_code_selector() & !3) - 16;
         let star = (user_code_base << 48) | (u64::from(gdt::KERNEL_CODE_SELECTOR) << 32);
         let lstar = leafos_syscall_entry as *const () as usize as u64;
         unsafe {
-            x86::msr::wrmsr(IA32_GS_BASE, kernel_gs_base);
+            install_cpu_local(0).expect("bootstrap CPU-local slot is valid");
             x86::msr::wrmsr(IA32_KERNEL_GSBASE, 0);
         }
         set_kernel_stack(kernel_stack_top);
@@ -782,10 +925,32 @@ pub fn set_kernel_stack(stack_top: VirtAddr) {
     let stack_top = VirtAddr::new(stack_top.as_u64() & !0xf);
     x86_64::instructions::interrupts::without_interrupts(|| {
         unsafe {
-            addr_of_mut!(LEAFOS_CPU_LOCAL.kernel_rsp).write(stack_top.as_u64());
+            core::arch::asm!(
+                "mov gs:[8], {}",
+                in(reg) stack_top.as_u64(),
+                options(nostack, preserves_flags)
+            );
         }
         gdt::set_kernel_stack(stack_top);
     });
+}
+
+/// Installs the GS-relative CPU-local block for the currently executing CPU.
+///
+/// # Safety
+///
+/// Call only with interrupts disabled before user-mode execution. The selected
+/// slot must remain permanently mapped while this CPU can enter the kernel.
+pub unsafe fn install_cpu_local(cpu_index: usize) -> Result<(), ()> {
+    if cpu_index >= MAX_CPUS {
+        return Err(());
+    }
+    let locals = addr_of_mut!(LEAFOS_CPU_LOCALS) as *mut CpuLocal;
+    let local = unsafe { locals.add(cpu_index) };
+    unsafe {
+        x86::msr::wrmsr(IA32_GS_BASE, local as u64);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

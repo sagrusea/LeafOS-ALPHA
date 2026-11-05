@@ -11,3 +11,12 @@ pub fn write_bytes(bytes: &[u8]) {
         serial::write_bytes(bytes);
     }
 }
+
+#[doc(hidden)]
+pub fn _print(args: core::fmt::Arguments) {
+    if framebuffer::is_initialized() {
+        framebuffer::_print(args);
+    } else {
+        serial::_print(args);
+    }
+}

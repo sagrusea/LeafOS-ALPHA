@@ -6,6 +6,7 @@
 *sh
 *ld2
 *efi
+*app
 roadMap.md
 i686-leafos.json
 rust-toolchain.toml
@@ -14,4 +15,6 @@ test
 # Added by cargo
 
 src/kernel/target
-
+tests/fixtures
+!tests/fixtures/gui_demo_app.c
+!tools/build-gui-demo-app.ps1

@@ -15,6 +15,7 @@ pub mod boot_info;
 pub mod console;
 pub mod drivers;
 pub mod fs;
+pub mod gui;
 pub mod memory;
 pub mod misc;
 pub mod shell;
@@ -101,8 +102,20 @@ pub fn shutdown() -> ! {
 pub fn init() {
     gdt::init();
     interrupts::init_idt();
-    unsafe { interrupts::PICS.lock().initialize() };
+    let apic_enabled = drivers::apic::initialize();
+    if apic_enabled {
+        unsafe { interrupts::PICS.lock().disable() };
+        serial_println!("[OK] Local APIC and I/O APIC enabled; legacy PIC masked");
+    } else {
+        unsafe { interrupts::PICS.lock().initialize() };
+        serial_println!("[WARN] APIC unavailable; using legacy PIC");
+    }
     timer::init();
+    gui::initialize();
+    drivers::mouse::initialize();
+    if !apic_enabled {
+        unsafe { interrupts::PICS.lock().enable_irq(12) };
+    }
     x86_64::instructions::interrupts::enable();
 }
 

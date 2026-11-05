@@ -28,6 +28,20 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         kernel::hlt_loop();
     }
     serial_println!("[OK] Physical memory manager initialized");
+    kernel::drivers::acpi::initialize(
+        boot_info.acpi_rsdp,
+        boot_info.physical_memory_offset,
+    );
+    if let Some(info) = kernel::drivers::acpi::info() {
+        serial_println!(
+            "[OK] ACPI MADT: {} enabled processor(s), LAPIC={:#x}, IOAPIC={:#x}",
+            info.processor_count,
+            info.local_apic_address,
+            info.io_apic_address
+        );
+    } else {
+        serial_println!("[WARN] ACPI MADT unavailable; SMP topology is unknown");
+    }
 
     if let Err(error) = unsafe { kernel::fs::initialize(boot_info) } {
         serial_println!("[FATAL] Initrd validation failed: {:?}", error);

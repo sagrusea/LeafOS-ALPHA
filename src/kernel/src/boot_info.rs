@@ -35,6 +35,8 @@ pub struct BootInfo {
 
     pub initrd_base: *const u8,
     pub initrd_size: usize,
+
+    pub acpi_rsdp: u64,
 }
 
 impl BootInfo {

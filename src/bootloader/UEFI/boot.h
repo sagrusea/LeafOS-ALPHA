@@ -109,6 +109,12 @@ typedef struct {
 #define EFI_DEVICE_PATH_PROTOCOL_GUID \
     EFI_GUID(0x09576E91, 0x6D3F, 0x11D2, 0x8E, 0x39, 0x00, 0xA0, 0xC9, 0x69, 0x72, 0x3B)
 
+#define ACPI_20_TABLE_GUID \
+    EFI_GUID(0x8868E871, 0xE4F1, 0x11D3, 0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81)
+
+#define ACPI_TABLE_GUID \
+    EFI_GUID(0xEB9D2D30, 0x2D88, 0x11D3, 0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D)
+
 /* ========================================================================== */
 /*                           MEMORY TYPES & MAP                               */
 /* ========================================================================== */
@@ -184,6 +190,11 @@ typedef struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL  EFI_SIMPLE_TEXT_INPUT_PROTOCOL;
 typedef struct _EFI_BOOT_SERVICES               EFI_BOOT_SERVICES;
 typedef struct _EFI_RUNTIME_SERVICES            EFI_RUNTIME_SERVICES;
 typedef struct _EFI_CONFIGURATION_TABLE         EFI_CONFIGURATION_TABLE;
+
+struct _EFI_CONFIGURATION_TABLE {
+    EFI_GUID VendorGuid;
+    VOID *VendorTable;
+};
 
 typedef struct {
     EFI_TABLE_HEADER                Hdr;

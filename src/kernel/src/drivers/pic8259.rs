@@ -80,6 +80,29 @@ impl Pic8259 {
             io_wait();
         }
     }
+
+    pub unsafe fn disable(&mut self) {
+        unsafe {
+            self.master_data.write(0xff);
+            self.slave_data.write(0xff);
+        }
+    }
+
+    pub unsafe fn enable_irq(&mut self, interrupt_id: u8) {
+        assert!(interrupt_id < IRQ_COUNT);
+        unsafe {
+            if interrupt_id < SLAVE_IRQ_BASE {
+                let mask = self.master_data.read();
+                self.master_data.write(mask & !(1 << interrupt_id));
+            } else {
+                let mask = self.slave_data.read();
+                self.slave_data
+                    .write(mask & !(1 << (interrupt_id - SLAVE_IRQ_BASE)));
+                let master_mask = self.master_data.read();
+                self.master_data.write(master_mask & !(1 << 2));
+            }
+        }
+    }
 }
 
 unsafe fn io_wait() {

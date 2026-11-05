@@ -189,6 +189,7 @@ impl CommandHistory {
 #[derive(Debug, PartialEq, Eq)]
 enum Command<'a> {
     Help,
+    Gui,
     Clear,
     Echo(&'a [u8]),
     Memory,
@@ -228,6 +229,9 @@ fn parse_command(line: &[u8]) -> Command<'_> {
     }
     if line.eq_ignore_ascii_case(b"help") {
         return Command::Help;
+    }
+    if line.eq_ignore_ascii_case(b"gui") {
+        return Command::Gui;
     }
     if line.eq_ignore_ascii_case(b"shutdown") || line.eq_ignore_ascii_case(b"sd") {
         return Command::Shutdown;
@@ -1463,11 +1467,15 @@ fn execute(
             gop_println!("  info [ -os | -hw | -sw ] Show detailed system information");
             gop_println!("  ps / processes          List scheduled tasks");
             gop_println!("  kill <task-id>          Terminate a non-running task");
+            gop_println!("  gui                     Show the LeafOS desktop preview");
             gop_println!(
                 "  shutdown / sd            Power off the system - DO NOT USE (halts cpu)"
             );
         }
-        Command::Clear => crate::framebuffer::clear(),
+        Command::Clear => {
+            crate::gui::leave();
+            crate::framebuffer::clear();
+        }
         Command::Echo(text) => {
             if let Ok(text) = core::str::from_utf8(text) {
                 gop_println!("{}", text);
@@ -1496,6 +1504,10 @@ fn execute(
             }
             _ => gop_println!("Usage: sleep <seconds> (0-3600)"),
         },
+        Command::Gui => {
+            crate::gui::show_desktop();
+            gop_println!("LeafOS GUI preview displayed. Type commands at the shell prompt.");
+        }
         Command::Processes => print_process_list(),
         Command::Kill(value) => match parse_task_id(value) {
             Some(task_id) => match crate::scheduler::terminate_task(task_id, 143) {
@@ -2020,6 +2032,7 @@ mod tests {
     #[test_case]
     fn parses_basic_commands() {
         assert_eq!(parse_command(b"help"), Command::Help);
+        assert_eq!(parse_command(b"gui"), Command::Gui);
         assert_eq!(parse_command(b"  clear "), Command::Clear);
         assert_eq!(parse_command(b"clr"), Command::Clear);
         assert_eq!(parse_command(b"cls"), Command::Clear);

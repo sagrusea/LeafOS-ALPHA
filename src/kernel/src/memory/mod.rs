@@ -43,6 +43,7 @@ pub enum MemoryError {
     NotInitialized,
     FrameAllocationFailed,
     NoUserAddressSpaceSlot,
+    MmioMappingFailed,
 }
 
 #[derive(Debug)]
@@ -674,6 +675,38 @@ impl MemoryManager<'_> {
         self.mapper.phys_offset()
     }
 
+    fn map_mmio_page(&mut self, physical: u64) -> Result<VirtAddr, MemoryError> {
+        let physical =
+            PhysAddr::try_new(physical).map_err(|_| MemoryError::PhysicalAddressOutOfRange)?;
+        let virtual_address = self
+            .mapper
+            .phys_offset()
+            .as_u64()
+            .checked_add(physical.as_u64())
+            .and_then(|address| VirtAddr::try_new(address).ok())
+            .ok_or(MemoryError::InvalidPhysicalMemoryOffset)?;
+        let page = Page::<Size4KiB>::containing_address(virtual_address);
+        if self.mapper.translate_addr(page.start_address()) == Some(physical) {
+            return Ok(virtual_address);
+        }
+        let frame = PhysFrame::containing_address(physical);
+        unsafe {
+            self.mapper
+                .map_to(
+                    page,
+                    frame,
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::NO_CACHE
+                        | PageTableFlags::NO_EXECUTE,
+                    &mut self.frame_allocator,
+                )
+                .map_err(|_| MemoryError::MmioMappingFailed)?
+                .flush();
+        }
+        Ok(virtual_address)
+    }
+
     pub fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         self.frame_allocator.allocate_frame()
     }
@@ -1106,6 +1139,10 @@ pub fn with_manager<R>(
         let mut manager = manager.lock();
         operation(&mut manager)
     }))
+}
+
+pub fn map_mmio_page(physical: u64) -> Result<VirtAddr, MemoryError> {
+    with_manager(|manager| manager.map_mmio_page(physical))?
 }
 
 pub fn create_address_space() -> Result<AddressSpace, AddressSpaceError> {
