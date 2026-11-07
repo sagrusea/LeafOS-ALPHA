@@ -166,3 +166,11 @@ leafos_gui_draw_rect:
     mov eax, 20
     syscall
     ret
+
+.global leafos_gui_draw_text
+.type leafos_gui_draw_text, @function
+leafos_gui_draw_text:
+    mov r10, rcx
+    mov eax, 21
+    syscall
+    ret

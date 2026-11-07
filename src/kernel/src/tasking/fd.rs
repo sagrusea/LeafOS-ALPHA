@@ -198,10 +198,38 @@ pub fn read(descriptor: &FileDescriptor, output: &mut [u8]) -> Result<usize, Rea
 }
 
 pub fn write(descriptor: &FileDescriptor, input: &[u8]) -> Result<usize, WriteError> {
+    write_inner(descriptor, input, None)
+}
+
+pub(crate) fn write_with_owner(
+    descriptor: &FileDescriptor,
+    input: &[u8],
+    owner: u64,
+) -> Result<usize, WriteError> {
+    write_inner(descriptor, input, Some(owner))
+}
+
+fn write_inner(
+    descriptor: &FileDescriptor,
+    input: &[u8],
+    owner: Option<u64>,
+) -> Result<usize, WriteError> {
     match descriptor {
         FileDescriptor::Console => {
-            crate::console::write_bytes(input);
-            Ok(input.len())
+            let owner = match owner {
+                Some(owner) => owner,
+                None => crate::tasking::scheduler::current_task_id()
+                    .map(|task| task.get())
+                    .ok_or(WriteError::Io)?,
+            };
+            if crate::gui::write_terminal(owner, input) {
+                Ok(input.len())
+            } else if !crate::framebuffer::is_initialized() {
+                crate::console::serial::write_bytes(input);
+                Ok(input.len())
+            } else {
+                Err(WriteError::Io)
+            }
         }
         FileDescriptor::PipeWrite(pipe) => {
             let mut pipe = pipe.lock();

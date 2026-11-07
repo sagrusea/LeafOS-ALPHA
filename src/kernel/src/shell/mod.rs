@@ -211,6 +211,7 @@ enum Command<'a> {
     Settings,
     SetColor(&'a [u8]),
     SetResolution(&'a [u8]),
+    SetMouseInverse,
     Info,
     InfoOs,
     InfoHardware,
@@ -343,6 +344,11 @@ fn parse_command(line: &[u8]) -> Command<'_> {
         }
         if target.eq_ignore_ascii_case(b"res") {
             return Command::SetResolution(trim_spaces(payload));
+        }
+        if target.eq_ignore_ascii_case(b"mouse")
+            && trim_spaces(payload).eq_ignore_ascii_case(b"inverse")
+        {
+            return Command::SetMouseInverse;
         }
         return Command::Settings;
     }
@@ -1426,6 +1432,9 @@ fn execute(
     current_dir_is_ext2: &mut bool,
     running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
 ) {
+    let mut terminal_batch_owner = crate::scheduler::current_task_id()
+        .map(|task| task.get())
+        .filter(|owner| crate::gui::begin_terminal_batch(*owner));
     if line.contains(&b'|') {
         launch_pipeline(
             line,
@@ -1433,48 +1442,69 @@ fn execute(
             *current_dir_is_ext2,
             running_apps,
         );
+        if let Some(owner) = terminal_batch_owner {
+            crate::gui::end_terminal_batch(owner);
+        }
         return;
     }
     match parse_command(line) {
         Command::Help => {
-            gop_println!("Common commands:");
-            gop_println!("  help                     Show this command list");
-            gop_println!("  cls / clear / clr        Clear the screen");
-            gop_println!("  echo <text>              Print text to the terminal");
-            gop_println!("  mem                     Show memory usage");
-            gop_println!("  uptime                  Show time since kernel startup");
-            gop_println!("  sleep <seconds>          Wait up to one hour");
-            gop_println!("  ls [path] / dir [path]   List files in a directory");
-            gop_println!("  cat <path>               Read a text file");
-            gop_println!("  cd [path]                Change directories");
-            gop_println!("  pwd                     Print the current directory");
-            gop_println!("  diskls [path]            List files on the ext2 data disk");
-            gop_println!("  diskcat <path>           Read a file from the ext2 data disk");
-            gop_println!("  diskwrite <path> [text]  Write a text file to the ext2 disk");
-            gop_println!("  mkdir <path>             Create an ext2 directory");
-            gop_println!("  rm <path>                Remove an ext2 file");
-            gop_println!("  rmdir <path>             Remove an empty ext2 directory");
-            gop_println!("  edit <path>              Edit a UTF-8 text file on the ext2 disk");
-            gop_println!("  run <app> [args...]       Start an app from the current filesystem");
-            gop_println!("  diskrun <app> [args...]   Start an app from the ext2 data disk");
-            gop_println!("  app ... > <path>          Redirect app stdout to an ext2 file");
-            gop_println!("  app ... < <path>          Read app stdin from an ext2 file");
-            gop_println!("  Up/Down                  Browse command history");
-            gop_println!("  PageUp/PageDown          Scroll terminal output; Esc returns");
-            gop_println!("  Left/Right, Home/End     Edit the command line");
-            gop_println!("  set col <color>          Change the terminal foreground color");
-            gop_println!("  set res <w>:<h>          Check the requested resolution");
-            gop_println!("  info [ -os | -hw | -sw ] Show detailed system information");
-            gop_println!("  ps / processes          List scheduled tasks");
-            gop_println!("  kill <task-id>          Terminate a non-running task");
-            gop_println!("  gui                     Show the LeafOS desktop preview");
-            gop_println!(
-                "  shutdown / sd            Power off the system - DO NOT USE (halts cpu)"
-            );
+            gop_println!("LeafOS commands");
+            gop_println!("===============");
+            gop_println!("Shell");
+            gop_println!("  help                 Show this guide");
+            gop_println!("  clear | cls | clr    Clear terminal output");
+            gop_println!("  echo <text>          Print text");
+            gop_println!("  Up/Down              Browse command history");
+            gop_println!("  Left/Right, Home/End Move the edit cursor");
+            gop_println!("  PageUp/PageDown      Browse scrollback; Esc returns to live output");
+            gop_println!();
+            gop_println!("Files: boot volume (read-only)");
+            gop_println!("  ls [path] | dir      List a directory");
+            gop_println!("  cat <path>           Print a file");
+            gop_println!("  cd [path]            Change directory; cd with no path goes to root");
+            gop_println!("  pwd                  Show the current directory");
+            gop_println!();
+            gop_println!("Files: ext2 data disk (writable)");
+            gop_println!("  diskls [path]        List a disk directory");
+            gop_println!("  diskcat <path>       Print a disk file");
+            gop_println!("  diskwrite <path> [text]  Create or replace a file");
+            gop_println!("  mkdir <path>         Create a directory");
+            gop_println!("  rm <path>            Remove a file");
+            gop_println!("  rmdir <path>         Remove an empty directory");
+            gop_println!("  edit <path>          Edit text; Ctrl+S saves, Esc quits");
+            gop_println!();
+            gop_println!("Applications");
+            gop_println!("  run <app> [args...]      Start an app from the current directory");
+            gop_println!("  diskrun <app> [args...]  Start an app from ext2");
+            gop_println!("  app [args...] > <file>   Redirect app output to an ext2 file");
+            gop_println!("  app [args...] < <file>   Read app input from an ext2 file");
+            gop_println!("  app1 | app2              Pipe output from app1 to app2");
+            gop_println!("  Example: echo hello | wc");
+            gop_println!();
+            gop_println!("System and desktop");
+            gop_println!("  mem                  Show memory usage");
+            gop_println!("  uptime               Show time since boot");
+            gop_println!("  sleep <seconds>      Pause (0-3600 seconds)");
+            gop_println!("  info                 Show OS, software and hardware details");
+            gop_println!("  info -os|-sw|-hw     Show one category of system information");
+            gop_println!("  ps | processes       List tasks; kill <task-id> stops a task");
+            gop_println!("  gui                  Open the desktop preview");
+            gop_println!("  shutdown | sd        Power off");
+            gop_println!();
+            gop_println!("Settings");
+            gop_println!("  set col <color>      Set text color (name or #RRGGBB)");
+            gop_println!("  set res <w>:<h>      Check a requested resolution, e.g. 1280:720");
+            gop_println!("  set mouse inverse    Toggle natural mouse-wheel scrolling");
         }
         Command::Clear => {
-            crate::gui::leave();
-            crate::framebuffer::clear();
+            let cleared = crate::scheduler::current_task_id()
+                .map(|task| crate::gui::clear_terminal(task.get()))
+                .unwrap_or(false);
+            if !cleared {
+                crate::gui::leave();
+                crate::framebuffer::clear();
+            }
         }
         Command::Echo(text) => {
             if let Ok(text) = core::str::from_utf8(text) {
@@ -1499,6 +1529,9 @@ fn execute(
         Command::Sleep(value) => match parse_sleep_seconds(value) {
             Some(seconds) if seconds <= MAX_SLEEP_SECONDS => {
                 gop_println!("Sleeping for {} second(s)...", seconds);
+                if let Some(owner) = terminal_batch_owner.take() {
+                    crate::gui::end_terminal_batch(owner);
+                }
                 crate::timer::sleep_ticks(seconds * crate::timer::TICKS_PER_SECOND);
                 gop_println!("Awake.");
             }
@@ -1507,6 +1540,13 @@ fn execute(
         Command::Gui => {
             crate::gui::show_desktop();
             gop_println!("LeafOS GUI preview displayed. Type commands at the shell prompt.");
+        }
+        Command::SetMouseInverse => {
+            let inverse = crate::gui::toggle_mouse_inverse();
+            gop_println!(
+                "Mouse scrolling: {}.",
+                if inverse { "natural" } else { "standard" }
+            );
         }
         Command::Processes => print_process_list(),
         Command::Kill(value) => match parse_task_id(value) {
@@ -1840,6 +1880,9 @@ fn execute(
         Command::SetColor(value) => match parse_color(value) {
             Some((red, green, blue)) => {
                 crate::framebuffer::set_color(red, green, blue);
+                if let Some(task) = crate::scheduler::current_task_id() {
+                    let _ = crate::gui::set_terminal_color(task.get(), (red, green, blue));
+                }
                 gop_println!("Text color updated.");
             }
             None => gop_println!("Use green, white, red, yellow, cyan, default, or #RRGGBB."),
@@ -1875,10 +1918,16 @@ fn execute(
         }
         Command::Shutdown => {
             gop_println!("Shutting down...");
+            if let Some(owner) = terminal_batch_owner.take() {
+                crate::gui::end_terminal_batch(owner);
+            }
             crate::shutdown();
         }
         Command::Unknown => gop_println!("Unknown command. Type 'help'."),
         Command::Empty => {}
+    }
+    if let Some(owner) = terminal_batch_owner {
+        crate::gui::end_terminal_batch(owner);
     }
 }
 
@@ -2112,6 +2161,14 @@ mod tests {
         assert_eq!(parse_command(b"cd"), Command::ChangeDirectory(b""));
         assert_eq!(parse_command(b"pwd"), Command::PrintWorkingDirectory);
         assert_eq!(parse_command(b"set col cyan"), Command::SetColor(b"cyan"));
+        assert_eq!(
+            parse_command(b"set mouse inverse"),
+            Command::SetMouseInverse
+        );
+        assert_eq!(
+            parse_command(b"SET\tMOUSE\tINVERSE"),
+            Command::SetMouseInverse
+        );
         assert_eq!(
             parse_command(b"set res 1024:768"),
             Command::SetResolution(b"1024:768")

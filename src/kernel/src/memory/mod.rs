@@ -5,7 +5,7 @@ use x86_64::{
     registers::control::Cr3,
     structures::paging::{
         FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
-        PhysFrame, Size4KiB, Translate,
+        PhysFrame, Size2MiB, Size4KiB, Translate,
         mapper::CleanUp,
         mapper::{MapToError, UnmapError},
         page::PageRangeInclusive,
@@ -707,6 +707,44 @@ impl MemoryManager<'_> {
         Ok(virtual_address)
     }
 
+    fn map_physical_page_at(
+        &mut self,
+        virtual_address: VirtAddr,
+        physical: u64,
+    ) -> Result<(), MemoryError> {
+        let physical =
+            PhysAddr::try_new(physical).map_err(|_| MemoryError::PhysicalAddressOutOfRange)?;
+        let page = Page::<Size4KiB>::containing_address(virtual_address);
+        if self.mapper.translate_addr(page.start_address()) == Some(physical) {
+            let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+            if let Ok(flush) = unsafe { self.mapper.update_flags(page, flags) } {
+                flush.flush();
+            } else {
+                let large_page = Page::<Size2MiB>::containing_address(virtual_address);
+                unsafe {
+                    self.mapper
+                        .update_flags(large_page, flags)
+                        .map_err(|_| MemoryError::MmioMappingFailed)?
+                        .flush();
+                }
+            }
+            return Ok(());
+        }
+        let frame = PhysFrame::containing_address(physical);
+        unsafe {
+            self.mapper
+                .map_to(
+                    page,
+                    frame,
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                    &mut self.frame_allocator,
+                )
+                .map_err(|_| MemoryError::MmioMappingFailed)?
+                .flush();
+        }
+        Ok(())
+    }
+
     pub fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         self.frame_allocator.allocate_frame()
     }
@@ -1143,6 +1181,11 @@ pub fn with_manager<R>(
 
 pub fn map_mmio_page(physical: u64) -> Result<VirtAddr, MemoryError> {
     with_manager(|manager| manager.map_mmio_page(physical))?
+}
+
+pub fn map_physical_page_at(virtual_address: u64, physical: u64) -> Result<(), MemoryError> {
+    let virtual_address = VirtAddr::new(virtual_address);
+    with_manager(|manager| manager.map_physical_page_at(virtual_address, physical))?
 }
 
 pub fn create_address_space() -> Result<AddressSpace, AddressSpaceError> {

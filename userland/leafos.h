@@ -26,6 +26,7 @@ typedef long long leafos_result_t;
 #define LEAFOS_SYS_GUI_POLL_EVENT 18
 #define LEAFOS_SYS_GUI_CLOSE_WINDOW 19
 #define LEAFOS_SYS_GUI_DRAW_RECT 20
+#define LEAFOS_SYS_GUI_DRAW_TEXT 21
 
 #define LEAFOS_MAX_SYSCALL_BUFFER 4096
 #define LEAFOS_MAX_SYSCALL_PATH 255
@@ -122,6 +123,14 @@ leafos_result_t leafos_gui_draw_rect(
     leafos_size_t y,
     leafos_size_t width,
     leafos_size_t height,
+    leafos_u64 rgb
+);
+leafos_result_t leafos_gui_draw_text(
+    leafos_u64 window_id,
+    leafos_size_t x,
+    leafos_size_t y,
+    const void *text,
+    leafos_size_t length,
     leafos_u64 rgb
 );
 

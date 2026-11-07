@@ -35,12 +35,25 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Keyboard.as_u8()].set_handler_fn(keyboard_interrupt_handler);
     idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt[PIC_2_OFFSET + 4].set_handler_fn(mouse_interrupt_handler);
+    idt[crate::drivers::apic::RESCHEDULE_VECTOR].set_handler_fn(reschedule_ipi_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt
 });
 
 pub fn init_idt() {
     IDT.load();
+}
+
+extern "x86-interrupt" fn reschedule_ipi_handler(stack_frame: InterruptStackFrame) {
+    let from_user = interrupted_from_user(&stack_frame);
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
+    crate::drivers::apic::eoi();
+    crate::tasking::scheduler::preempt_from_timer();
+    if from_user {
+        unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
+    }
 }
 
 extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
@@ -116,12 +129,12 @@ fn interrupted_from_user(stack_frame: &InterruptStackFrame) -> bool {
     stack_frame.code_segment.0 & 3 == 3
 }
 
-extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn keyboard_interrupt_handler(stack_frame: InterruptStackFrame) {
     use crate::drivers::{KeyCode, KeyState, Keyboard};
     use x86_64::instructions::port::Port;
 
     static KEYBOARD: Mutex<Keyboard> = Mutex::new(Keyboard::new());
-    let user_task_running = crate::tasking::scheduler::current_task_is_user();
+    let user_task_running = interrupted_from_user(&stack_frame);
 
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
@@ -135,6 +148,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                     || (0x20..=0x7e).contains(&byte)
                 {
                     if user_task_running && byte == 0x03 {
+                        drop(keyboard);
                         unsafe {
                             signal_eoi(InterruptIndex::Keyboard.as_u8() - PIC_1_OFFSET);
                         }
@@ -147,6 +161,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                     } else {
                         crate::gui::push_key(byte);
                         shell::enqueue_key(byte);
+                        crate::tasking::scheduler::wake_all_blocked_tasks();
                     }
                 }
             } else {
@@ -167,6 +182,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
                         crate::drivers::input::enqueue(key);
                     } else {
                         shell::enqueue_key(key);
+                        crate::tasking::scheduler::wake_all_blocked_tasks();
                     }
                 }
             }

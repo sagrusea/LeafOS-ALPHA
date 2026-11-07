@@ -4,9 +4,9 @@ use super::acpi;
 use x86::msr::{IA32_APIC_BASE, rdmsr, wrmsr};
 
 const APIC_ENABLE: u64 = 1 << 11;
-const LOCAL_APIC_SVR: usize = 0x0f0 / 4;
 const LOCAL_APIC_EOI: usize = 0x0b0 / 4;
 const LOCAL_APIC_ID: usize = 0x020 / 4;
+const LOCAL_APIC_SVR: usize = 0x0f0 / 4;
 const LOCAL_APIC_ICR_LOW: usize = 0x300 / 4;
 const LOCAL_APIC_ICR_HIGH: usize = 0x310 / 4;
 const IO_APIC_REG: usize = 0;
@@ -16,9 +16,13 @@ const IO_APIC_REDIRECTION_BASE: u8 = 0x10;
 const IRQ_VECTOR_BASE: u8 = 32;
 const ICR_DELIVERY_STATUS: u32 = 1 << 12;
 const ICR_ASSERT: u32 = 1 << 14;
+const ICR_TRIGGER_LEVEL: u32 = 1 << 15;
 const ICR_INIT: u32 = 5 << 8;
 const ICR_STARTUP: u32 = 6 << 8;
+const ICR_LEVEL_DEASSERT: u32 = 0;
+const ICR_FIXED: u32 = 0;
 const IPI_TIMEOUT: usize = 1_000_000;
+pub const RESCHEDULE_VECTOR: u8 = 0xf0;
 
 struct Apic {
     local: *mut u32,
@@ -156,30 +160,55 @@ pub fn is_initialized() -> bool {
     APIC.get().is_some_and(Option::is_some)
 }
 
+pub fn initialize_secondary_local() -> bool {
+    let Some(Some(apic)) = APIC.get() else {
+        return false;
+    };
+    unsafe {
+        let mut base = rdmsr(IA32_APIC_BASE);
+        base |= APIC_ENABLE;
+        wrmsr(IA32_APIC_BASE, base);
+        apic.lock().local_write(LOCAL_APIC_SVR, 0x100 | 0xff);
+    }
+    true
+}
+
 pub fn eoi() {
     if let Some(Some(apic)) = APIC.get() {
         unsafe { apic.lock().eoi() };
     }
+}
 
-    pub fn current_apic_id() -> Option<u32> {
-        let apic = APIC.get()?.as_ref()?;
-        Some(unsafe { apic.lock().local.add(LOCAL_APIC_ID).read_volatile() >> 24 })
-    }
+pub fn send_reschedule_ipi(apic_id: u32) -> bool {
+    send_ipi(apic_id, ICR_FIXED | u32::from(RESCHEDULE_VECTOR))
+}
 
-    pub fn send_init_ipi(apic_id: u32) -> bool {
-        let Some(Some(apic)) = APIC.get() else {
-            return false;
-        };
-        unsafe { apic.lock().send_ipi(apic_id, ICR_INIT | ICR_ASSERT) }
-    }
+pub fn current_apic_id() -> Option<u32> {
+    let apic = APIC.get()?.as_ref()?;
+    Some(unsafe { apic.lock().local.add(LOCAL_APIC_ID).read_volatile() >> 24 })
+}
 
-    pub fn send_startup_ipi(apic_id: u32, vector: u8) -> bool {
-        let Some(Some(apic)) = APIC.get() else {
-            return false;
-        };
-        unsafe {
-            apic.lock()
-                .send_ipi(apic_id, ICR_STARTUP | u32::from(vector))
-        }
+pub fn send_init_ipi(apic_id: u32) -> bool {
+    if !send_ipi(
+        apic_id,
+        ICR_INIT | ICR_ASSERT | ICR_TRIGGER_LEVEL,
+    ) {
+        return false;
     }
+    crate::timer::sleep_ticks(1);
+    send_ipi(
+        apic_id,
+        ICR_INIT | ICR_LEVEL_DEASSERT | ICR_TRIGGER_LEVEL,
+    )
+}
+
+pub fn send_startup_ipi(apic_id: u32, vector: u8) -> bool {
+    send_ipi(apic_id, ICR_STARTUP | u32::from(vector))
+}
+
+fn send_ipi(apic_id: u32, command: u32) -> bool {
+    let Some(Some(apic)) = APIC.get() else {
+        return false;
+    };
+    unsafe { apic.lock().send_ipi(apic_id, command) }
 }

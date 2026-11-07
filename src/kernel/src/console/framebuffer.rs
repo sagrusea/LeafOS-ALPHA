@@ -2,6 +2,8 @@ use crate::boot_info::{self, BootInfo};
 use crate::misc::font::get_glyph;
 use crate::sync::{Mutex, Once};
 use alloc::collections::VecDeque;
+use alloc::vec;
+use alloc::vec::Vec;
 use core::fmt;
 use core::ptr::NonNull;
 
@@ -102,7 +104,8 @@ impl FramebufferBuffer {
 }
 
 const MARGIN: usize = 8;
-const CHAR_WIDTH: usize = 8;
+const CHAR_WIDTH: usize = 9;
+const GLYPH_WIDTH: usize = 8;
 const LINE_HEIGHT: usize = 16;
 const INPUT_LINE_CAPACITY: usize = 256;
 const SCROLLBACK_LINE_CAPACITY: usize = 256;
@@ -130,6 +133,9 @@ impl TerminalLine {
 
 pub struct FramebufferWriter {
     info: FramebufferInfo,
+    back_buffer: Vec<u8>,
+    defer_flush: bool,
+    dirty: Option<(usize, usize, usize, usize)>,
     x: usize,
     y: usize,
     fg: (u8, u8, u8),
@@ -149,8 +155,12 @@ pub struct FramebufferWriter {
 
 impl FramebufferWriter {
     pub fn new(info: FramebufferInfo) -> Self {
+        let back_buffer_size = info.stride * info.height;
         let mut writer = Self {
             info,
+            back_buffer: vec![0; back_buffer_size],
+            defer_flush: false,
+            dirty: None,
             x: MARGIN,
             y: MARGIN,
             fg: DEFAULT_FG,
@@ -177,7 +187,8 @@ impl FramebufferWriter {
 
     pub fn clear(&mut self) {
         let total_size = self.info.stride * self.info.height;
-        self.info.buffer.write_bytes(0, total_size, 0);
+        self.back_buffer[..total_size].fill(0);
+        self.dirty = Some((0, 0, self.info.width, self.info.height));
         self.history.clear();
         self.history.push_back(TerminalLine::new(0));
         self.current_line_id = 0;
@@ -304,7 +315,7 @@ impl FramebufferWriter {
         let glyph = get_glyph(byte);
         let (r, g, b) = color;
         for (row, row_data) in glyph.iter().copied().enumerate() {
-            for col in 0..CHAR_WIDTH {
+            for col in 0..GLYPH_WIDTH {
                 if (row_data >> (7 - col)) & 1 == 1 {
                     self.write_pixel(x + col, y + row, r, g, b);
                 }
@@ -316,7 +327,7 @@ impl FramebufferWriter {
         let (r, g, b) = self.fg;
         let glyph = get_glyph(byte);
         for (row, row_data) in glyph.iter().copied().enumerate() {
-            for col in 0..CHAR_WIDTH {
+            for col in 0..GLYPH_WIDTH {
                 let foreground = (row_data >> (7 - col)) & 1 == 1;
                 if foreground {
                     self.write_pixel(x + col, y + row, 0, 0, 0);
@@ -493,7 +504,7 @@ impl FramebufferWriter {
     fn clear_rows(&mut self, start_row: usize, count: usize) {
         let stride = self.info.stride;
         let offset = start_row * stride;
-        self.info.buffer.write_bytes(offset, count * stride, 0);
+        self.back_buffer[offset..offset + count * stride].fill(0);
     }
 
     fn scroll_up(&mut self, rows: usize) {
@@ -509,7 +520,8 @@ impl FramebufferWriter {
         let src_offset = rows * stride;
         let count = (height - rows) * stride;
 
-        self.info.buffer.copy_within(src_offset, 0, count);
+        self.back_buffer
+            .copy_within(src_offset..src_offset + count, 0);
         self.clear_rows(height - rows, rows);
         if let Some((_, origin_y)) = self.input_origin.as_mut() {
             *origin_y = origin_y.saturating_sub(rows);
@@ -528,15 +540,35 @@ impl FramebufferWriter {
         }
         let offset = y * self.info.stride + x * self.info.bytes_per_pixel;
 
-        if self.info.bgr {
-            self.info.buffer.write_volatile(offset, b);
-            self.info.buffer.write_volatile(offset + 1, g);
-            self.info.buffer.write_volatile(offset + 2, r);
+        if self.info.bytes_per_pixel == 4 {
+            let packed = if self.info.bgr {
+                0xff00_0000
+                    | u32::from(b)
+                    | (u32::from(g) << 8)
+                    | (u32::from(r) << 16)
+            } else {
+                0xff00_0000
+                    | u32::from(r)
+                    | (u32::from(g) << 8)
+                    | (u32::from(b) << 16)
+            };
+            unsafe {
+                self.back_buffer
+                    .as_mut_ptr()
+                    .add(offset)
+                    .cast::<u32>()
+                    .write_unaligned(packed);
+            }
+        } else if self.info.bgr {
+            self.back_buffer[offset] = b;
+            self.back_buffer[offset + 1] = g;
+            self.back_buffer[offset + 2] = r;
         } else {
-            self.info.buffer.write_volatile(offset, r);
-            self.info.buffer.write_volatile(offset + 1, g);
-            self.info.buffer.write_volatile(offset + 2, b);
+            self.back_buffer[offset] = r;
+            self.back_buffer[offset + 1] = g;
+            self.back_buffer[offset + 2] = b;
         }
+        self.mark_dirty(x, y, 1, 1);
     }
 
     pub fn fill_rect(&mut self, x: usize, y: usize, width: usize, height: usize, color: (u8, u8, u8)) {
@@ -547,6 +579,12 @@ impl FramebufferWriter {
         if start_x >= end_x || start_y >= end_y {
             return;
         }
+        self.mark_dirty(
+            start_x,
+            start_y,
+            end_x.saturating_sub(start_x),
+            end_y.saturating_sub(start_y),
+        );
         if self.info.bytes_per_pixel != 4 {
             for row in start_y..end_y {
                 for column in start_x..end_x {
@@ -567,16 +605,62 @@ impl FramebufferWriter {
                 | (u32::from(color.2) << 16)
         };
         for row in start_y..end_y {
-            let address = self.info.buffer.addr()
-                + row * self.info.stride
-                + start_x * self.info.bytes_per_pixel;
             let pixels = end_x - start_x;
             unsafe {
-                let row = address as *mut u32;
+                let offset = row * self.info.stride + start_x * self.info.bytes_per_pixel;
+                let row = self.back_buffer.as_mut_ptr().add(offset) as *mut u32;
                 for column in 0..pixels {
-                    row.add(column).write_volatile(packed);
+                    row.add(column).write_unaligned(packed);
                 }
             }
+        }
+    }
+
+    pub fn flush_rect(&mut self, x: usize, y: usize, width: usize, height: usize) {
+        let start_x = x.min(self.info.width);
+        let start_y = y.min(self.info.height);
+        let end_x = x.saturating_add(width).min(self.info.width);
+        let end_y = y.saturating_add(height).min(self.info.height);
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+        let bytes = (end_x - start_x) * self.info.bytes_per_pixel;
+        for row in start_y..end_y {
+            let offset = row * self.info.stride + start_x * self.info.bytes_per_pixel;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.back_buffer.as_ptr().add(offset),
+                    self.info.buffer.ptr.as_ptr().add(offset),
+                    bytes,
+                );
+            }
+        }
+    }
+
+    pub fn flush(&mut self) {
+        self.flush_rect(0, 0, self.info.width, self.info.height);
+    }
+
+    fn mark_dirty(&mut self, x: usize, y: usize, width: usize, height: usize) {
+        let end_x = x.saturating_add(width).min(self.info.width);
+        let end_y = y.saturating_add(height).min(self.info.height);
+        if x >= end_x || y >= end_y {
+            return;
+        }
+        self.dirty = Some(match self.dirty {
+            Some((old_x, old_y, old_end_x, old_end_y)) => (
+                old_x.min(x),
+                old_y.min(y),
+                old_end_x.max(end_x),
+                old_end_y.max(end_y),
+            ),
+            None => (x, y, end_x, end_y),
+        });
+    }
+
+    pub fn flush_dirty(&mut self) {
+        if let Some((x, y, end_x, end_y)) = self.dirty.take() {
+            self.flush_rect(x, y, end_x.saturating_sub(x), end_y.saturating_sub(y));
         }
     }
 
@@ -600,7 +684,7 @@ impl FramebufferWriter {
         let (r, g, b) = self.fg;
         for row in 0..8 {
             let row_data = glyph[row];
-            for col in 0..8 {
+            for col in 0..GLYPH_WIDTH {
                 if (row_data >> (7 - col)) & 1 == 1 {
                     self.write_pixel(self.x + col, self.y + row, r, g, b);
                 }
@@ -666,7 +750,7 @@ impl FramebufferWriter {
 
     fn render_history_view(&mut self) {
         let total_size = self.info.stride * self.info.height;
-        self.info.buffer.write_bytes(0, total_size, 0);
+        self.back_buffer[..total_size].fill(0);
         let rows = self.visible_rows();
         if rows == 0 {
             return;
@@ -817,7 +901,11 @@ pub fn dimensions() -> Option<(usize, usize)> {
 pub fn clear() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
-            writer.lock().clear();
+            let mut writer = writer.lock();
+            writer.clear();
+            if !writer.defer_flush {
+                writer.flush_dirty();
+            }
         }
     });
 }
@@ -825,38 +913,70 @@ pub fn clear() {
 pub fn backspace() {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
-            writer.lock().backspace();
+            let mut writer = writer.lock();
+            writer.backspace();
+            if !writer.defer_flush {
+                writer.flush_dirty();
+            }
         }
     });
 }
 
 pub fn begin_input_line() {
+    if let Some(owner) = current_terminal_owner()
+        && crate::gui::begin_terminal_input(owner)
+    {
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
-            writer.lock().begin_input_line();
+            let mut writer = writer.lock();
+            writer.begin_input_line();
+            if !writer.defer_flush {
+                writer.flush_dirty();
+            }
         }
     });
 }
 
 pub fn finish_input_line() {
+    if let Some(owner) = current_terminal_owner()
+        && crate::gui::finish_terminal_input(owner)
+    {
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
-            writer.lock().finish_input_line();
+            let mut writer = writer.lock();
+            writer.finish_input_line();
+            if !writer.defer_flush {
+                writer.flush_dirty();
+            }
         }
     });
 }
 
 pub fn redraw_input_line(bytes: &[u8], cursor: usize) {
+    if let Some(owner) = current_terminal_owner()
+        && crate::gui::redraw_terminal_input(owner, bytes, cursor)
+    {
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
-            writer
-                .lock()
-                .redraw_input_line(bytes, cursor.min(bytes.len()));
+            let mut writer = writer.lock();
+            writer.redraw_input_line(bytes, cursor.min(bytes.len()));
+            if !writer.defer_flush {
+                writer.flush_dirty();
+            }
         }
     });
 }
 
 pub fn scrollback_page_up() {
+    if current_terminal_owner().is_some() {
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
             writer.lock().scrollback_page(true);
@@ -865,6 +985,9 @@ pub fn scrollback_page_up() {
 }
 
 pub fn scrollback_page_down() {
+    if current_terminal_owner().is_some() {
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
             writer.lock().scrollback_page(false);
@@ -873,6 +996,9 @@ pub fn scrollback_page_down() {
 }
 
 pub fn scrollback_to_bottom() -> bool {
+    if current_terminal_owner().is_some() {
+        return false;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
             let mut writer = writer.lock();
@@ -888,6 +1014,9 @@ pub fn scrollback_to_bottom() -> bool {
 }
 
 pub fn is_scrollback_active() -> bool {
+    if current_terminal_owner().is_some() {
+        return false;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         WRITER
             .get()
@@ -896,6 +1025,17 @@ pub fn is_scrollback_active() -> bool {
 }
 
 pub fn render_editor(name: &str, text: &str, cursor: usize, dirty: bool) {
+    if let Some(owner) = current_terminal_owner()
+        && crate::gui::render_terminal_editor(
+            owner,
+            name.as_bytes(),
+            text.as_bytes(),
+            cursor,
+            dirty,
+        )
+    {
+        return;
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
             writer.lock().render_editor(name, text, cursor, dirty);
@@ -903,7 +1043,17 @@ pub fn render_editor(name: &str, text: &str, cursor: usize, dirty: bool) {
     });
 }
 
+fn current_terminal_owner() -> Option<u64> {
+    let owner = crate::tasking::scheduler::current_task_id()?.get();
+    crate::gui::has_terminal(owner).then_some(owner)
+}
+
 pub fn finish_editor() {
+    if let Some(owner) = current_terminal_owner()
+        && crate::gui::clear_terminal(owner)
+    {
+        return;
+    }
     clear();
 }
 
@@ -918,7 +1068,11 @@ pub fn set_color(r: u8, g: u8, b: u8) {
 pub fn draw_rect(x: usize, y: usize, width: usize, height: usize, color: (u8, u8, u8)) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
-            writer.lock().fill_rect(x, y, width, height, color);
+            let mut writer = writer.lock();
+            writer.fill_rect(x, y, width, height, color);
+            if !writer.defer_flush {
+                writer.flush_rect(x, y, width, height);
+            }
         }
     });
 }
@@ -934,12 +1088,26 @@ pub fn xor_rect(x: usize, y: usize, width: usize, height: usize, color: (u8, u8,
                     let offset = row * writer.info.stride
                         + column * writer.info.bytes_per_pixel;
                     let bgr = writer.info.bgr;
-                    let buffer = &mut writer.info.buffer;
-                    let red_offset = if bgr { 2 } else { 0 };
-                    buffer.xor_byte(offset + red_offset, color.0);
-                    buffer.xor_byte(offset + 1, color.1);
-                    buffer.xor_byte(offset + if bgr { 0 } else { 2 }, color.2);
+                    if writer.info.bytes_per_pixel == 4 {
+                        let packed = if bgr {
+                            u32::from(color.2)
+                                | (u32::from(color.1) << 8)
+                                | (u32::from(color.0) << 16)
+                        } else {
+                            u32::from(color.0)
+                                | (u32::from(color.1) << 8)
+                                | (u32::from(color.2) << 16)
+                        };
+                        unsafe {
+                            let pixel = writer.back_buffer.as_mut_ptr().add(offset).cast::<u32>();
+                            let current = pixel.read_unaligned();
+                            pixel.write_unaligned(current ^ packed);
+                        }
+                    }
                 }
+            }
+            if !writer.defer_flush {
+                writer.flush_rect(x, y, width, height);
             }
         }
     });
@@ -953,7 +1121,7 @@ pub fn draw_text(x: usize, y: usize, text: &[u8], color: (u8, u8, u8)) {
                 let glyph = get_glyph(byte);
                 let origin_x = x.saturating_add(index.saturating_mul(CHAR_WIDTH));
                 for row in 0..8 {
-                    for column in 0..8 {
+                    for column in 0..GLYPH_WIDTH {
                         if (glyph[row] >> (7 - column)) & 1 == 1 {
                             writer.write_pixel(
                                 origin_x + column,
@@ -966,8 +1134,105 @@ pub fn draw_text(x: usize, y: usize, text: &[u8], color: (u8, u8, u8)) {
                     }
                 }
             }
+            if !writer.defer_flush {
+                writer.flush_rect(x, y, text.len().saturating_mul(CHAR_WIDTH), 8);
+            }
         }
     });
+}
+
+pub fn snapshot_rect(
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+) -> Option<(usize, usize, Vec<u8>)> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let writer = WRITER.get()?;
+        let writer = writer.lock();
+        let start_x = x.min(writer.info.width);
+        let start_y = y.min(writer.info.height);
+        let end_x = x.saturating_add(width).min(writer.info.width);
+        let end_y = y.saturating_add(height).min(writer.info.height);
+        if start_x >= end_x || start_y >= end_y {
+            return None;
+        }
+        let row_bytes = end_x
+            .saturating_sub(start_x)
+            .checked_mul(writer.info.bytes_per_pixel)?;
+        let snapshot_size = row_bytes.checked_mul(end_y.saturating_sub(start_y))?;
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(snapshot_size).ok()?;
+        pixels.resize(snapshot_size, 0);
+        for row in 0..end_y.saturating_sub(start_y) {
+            let source_offset =
+                (start_y + row) * writer.info.stride + start_x * writer.info.bytes_per_pixel;
+            let destination_offset = row * row_bytes;
+            pixels[destination_offset..destination_offset + row_bytes]
+                .copy_from_slice(&writer.back_buffer[source_offset..source_offset + row_bytes]);
+        }
+        Some((end_x - start_x, end_y - start_y, pixels))
+    })
+}
+
+pub fn blit_rect(x: usize, y: usize, width: usize, height: usize, pixels: &[u8]) -> bool {
+    blit_snapshot_rect(x, y, 0, 0, width, height, width, height, pixels)
+}
+
+pub fn blit_snapshot_rect(
+    x: usize,
+    y: usize,
+    source_x: usize,
+    source_y: usize,
+    width: usize,
+    height: usize,
+    source_width: usize,
+    source_height: usize,
+    pixels: &[u8],
+) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let Some(writer) = WRITER.get() else {
+            return false;
+        };
+        let mut writer = writer.lock();
+        let start_x = x.min(writer.info.width);
+        let start_y = y.min(writer.info.height);
+        let end_x = x.saturating_add(width).min(writer.info.width);
+        let end_y = y.saturating_add(height).min(writer.info.height);
+        if start_x >= end_x || start_y >= end_y {
+            return false;
+        }
+        let copied_width = end_x.saturating_sub(start_x);
+        let copied_height = end_y.saturating_sub(start_y);
+        if source_x.saturating_add(copied_width) > source_width
+            || source_y.saturating_add(copied_height) > source_height
+        {
+            return false;
+        }
+        let Some(source_stride) = source_width.checked_mul(writer.info.bytes_per_pixel) else {
+            return false;
+        };
+        let Some(required_size) = source_stride.checked_mul(source_height) else {
+            return false;
+        };
+        if pixels.len() < required_size {
+            return false;
+        }
+        let copied_row_bytes = copied_width * writer.info.bytes_per_pixel;
+        for row in 0..copied_height {
+            let source_offset =
+                (source_y + row) * source_stride + source_x * writer.info.bytes_per_pixel;
+            let destination_offset =
+                (start_y + row) * writer.info.stride + start_x * writer.info.bytes_per_pixel;
+            writer.back_buffer[destination_offset..destination_offset + copied_row_bytes]
+                .copy_from_slice(&pixels[source_offset..source_offset + copied_row_bytes]);
+        }
+        writer.mark_dirty(start_x, start_y, copied_width, copied_height);
+        if !writer.defer_flush {
+            writer.flush_rect(start_x, start_y, copied_width, copied_height);
+        }
+        true
+    })
 }
 
 #[doc(hidden)]
@@ -975,7 +1240,48 @@ pub fn _print(args: fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(writer) = WRITER.get() {
             use core::fmt::Write;
-            writer.lock().write_fmt(args).ok();
+            let mut writer = writer.lock();
+            writer.write_fmt(args).ok();
+            if !writer.defer_flush {
+                writer.flush_dirty();
+            }
+        }
+    });
+}
+
+pub fn begin_frame() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().defer_flush = true;
+        }
+    });
+}
+
+pub fn end_frame() {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            let mut writer = writer.lock();
+            writer.defer_flush = false;
+            writer.flush_dirty();
+        }
+    });
+}
+
+pub fn end_frame_with_rect(x: usize, y: usize, width: usize, height: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            let mut writer = writer.lock();
+            writer.defer_flush = false;
+            writer.dirty = None;
+            writer.flush_rect(x, y, width, height);
+        }
+    });
+}
+
+pub fn flush_rect(x: usize, y: usize, width: usize, height: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(writer) = WRITER.get() {
+            writer.lock().flush_rect(x, y, width, height);
         }
     });
 }
@@ -1053,6 +1359,48 @@ mod tests {
     }
 
     #[test_case]
+    fn cached_rectangles_round_trip_through_the_back_buffer() {
+        init_test_framebuffer();
+        reset_writer();
+        draw_rect(12, 14, 3, 2, (12, 34, 56));
+        let (width, height, pixels) =
+            snapshot_rect(12, 14, 3, 2).expect("visible rectangle should be captured");
+        assert_eq!((width, height), (3, 2));
+        draw_rect(24, 28, width, height, (0, 0, 0));
+        begin_frame();
+        assert!(blit_rect(24, 28, width, height, &pixels));
+        end_frame();
+
+        let writer = WRITER.get().unwrap().lock();
+        let source_offset = 14 * writer.info.stride + 12 * writer.info.bytes_per_pixel;
+        let destination_offset = 28 * writer.info.stride + 24 * writer.info.bytes_per_pixel;
+        let row_bytes = width * writer.info.bytes_per_pixel;
+        for row in 0..height {
+            let source = source_offset + row * writer.info.stride;
+            let destination = destination_offset + row * writer.info.stride;
+            assert_eq!(
+                &writer.back_buffer[source..source + row_bytes],
+                &writer.back_buffer[destination..destination + row_bytes]
+            );
+        }
+        drop(writer);
+
+        begin_frame();
+        assert!(blit_snapshot_rect(
+            32, 40, 1, 1, 2, 1, width, height, &pixels
+        ));
+        end_frame();
+
+        let writer = WRITER.get().unwrap().lock();
+        let destination = 40 * writer.info.stride + 32 * writer.info.bytes_per_pixel;
+        let source = (width + 1) * writer.info.bytes_per_pixel;
+        assert_eq!(
+            &writer.back_buffer[destination..destination + 2 * writer.info.bytes_per_pixel],
+            &pixels[source..source + 2 * writer.info.bytes_per_pixel]
+        );
+    }
+
+    #[test_case]
     fn test_gop_println_simple() {
         init_test_framebuffer();
         x86_64::instructions::interrupts::without_interrupts(|| {
@@ -1062,6 +1410,19 @@ mod tests {
             let writer = WRITER.get().unwrap().lock();
             assert_eq!(writer.x, MARGIN);
             assert_eq!(writer.y, MARGIN + LINE_HEIGHT);
+        });
+    }
+
+    #[test_case]
+    fn text_cells_include_one_pixel_of_letter_spacing() {
+        init_test_framebuffer();
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            reset_writer();
+            gop_print!("AB");
+
+            let writer = WRITER.get().unwrap().lock();
+            assert_eq!(CHAR_WIDTH, 9);
+            assert_eq!(writer.x, MARGIN + 2 * 9);
         });
     }
 
@@ -1132,7 +1493,7 @@ mod tests {
             for (char_index, byte) in text.bytes().enumerate() {
                 let glyph = get_glyph(byte);
                 for (row, glyph_row) in glyph.iter().enumerate() {
-                    for col in 0..CHAR_WIDTH {
+                    for col in 0..GLYPH_WIDTH {
                         let expected_green = (glyph_row >> (7 - col)) & 1 == 1;
                         let pixel_offset = (MARGIN + row) * writer.info.stride
                             + (MARGIN + char_index * CHAR_WIDTH + col)

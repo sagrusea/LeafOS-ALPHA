@@ -97,6 +97,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
     };
 
+    let secondary_cpus = kernel::smp::start_secondaries();
+    serial_println!(
+        "[INFO] {} secondary CPU(s) entered the shared scheduler",
+        secondary_cpus
+    );
+
     if let Err(error) = kernel::scheduler::run_tasks() {
         serial_println!(
             "[FATAL] Scheduler failed while running shell task {}: {:?}",
@@ -114,6 +120,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 }
 
 fn shell_service() {
+    if kernel::framebuffer::is_initialized() {
+        let Some(owner) = kernel::scheduler::current_task_id() else {
+            serial_println!("[FATAL] Shell task has no scheduler owner");
+            kernel::scheduler::exit_current();
+        };
+        if kernel::gui::open_terminal_window(owner.get()).is_none() {
+            serial_println!("[FATAL] Could not create the shell terminal window");
+            kernel::scheduler::exit_current();
+        }
+    }
     kernel::shell::run()
 }
 

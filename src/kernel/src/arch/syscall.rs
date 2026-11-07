@@ -55,6 +55,8 @@ pub const SYS_GUI_POLL_EVENT: u64 = 18;
 pub const SYS_GUI_CLOSE_WINDOW: u64 = 19;
 /// Draw a retained rectangle in an owned window.
 pub const SYS_GUI_DRAW_RECT: u64 = 20;
+/// Draw retained text in an owned window.
+pub const SYS_GUI_DRAW_TEXT: u64 = 21;
 
 pub const MAX_SYSCALL_BUFFER: usize = 4096;
 pub const MAX_SYSCALL_PATH: usize = 255;
@@ -118,6 +120,7 @@ pub struct SyscallFrame {
 pub struct CpuLocal {
     pub user_rsp: u64,
     pub kernel_rsp: u64,
+    pub cpu_index: u64,
 }
 
 pub const MAX_CPUS: usize = 64;
@@ -127,6 +130,7 @@ static mut LEAFOS_CPU_LOCALS: [CpuLocal; MAX_CPUS] =
     [CpuLocal {
         user_rsp: 0,
         kernel_rsp: 0,
+        cpu_index: 0,
     }; MAX_CPUS];
 
 pub(crate) unsafe fn user_rsp() -> u64 {
@@ -264,6 +268,7 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         SYS_GUI_POLL_EVENT => sys_gui_poll_event(frame),
         SYS_GUI_CLOSE_WINDOW => sys_gui_close_window(frame),
         SYS_GUI_DRAW_RECT => sys_gui_draw_rect(frame),
+        SYS_GUI_DRAW_TEXT => sys_gui_draw_text(frame),
         _ => SYSCALL_NOT_IMPLEMENTED,
     }
 }
@@ -326,11 +331,17 @@ fn sys_gui_poll_event(frame: &SyscallFrame) -> u64 {
                 output[0] = 1;
                 output[8] = byte;
             }
-            crate::gui::GuiEvent::Mouse { x, y, buttons } => {
+            crate::gui::GuiEvent::Mouse {
+                x,
+                y,
+                buttons,
+                wheel_delta,
+            } => {
                 output[0] = 2;
                 output[8..16].copy_from_slice(&i64::from(x).to_le_bytes());
                 output[16..24].copy_from_slice(&i64::from(y).to_le_bytes());
                 output[24] = buttons;
+                output[25..29].copy_from_slice(&wheel_delta.to_le_bytes());
             }
         }
         crate::tasking::scheduler::copy_to_current_user(frame.rdi, &output)
@@ -359,6 +370,7 @@ fn sys_gui_draw_rect(frame: &SyscallFrame) -> u64 {
     {
         return SYS_ERR_EINVAL;
     }
+
     let owner = crate::tasking::scheduler::current_task_id()
         .map(|task| task.get())
         .unwrap_or(0);
@@ -374,6 +386,47 @@ fn sys_gui_draw_rect(frame: &SyscallFrame) -> u64 {
         frame.rdx as usize,
         frame.r10 as usize,
         frame.r8 as usize,
+        color,
+    ) {
+        0
+    } else {
+        SYS_ERR_EINVAL
+    }
+
+}
+
+fn sys_gui_draw_text(frame: &SyscallFrame) -> u64 {
+    const MAX_TEXT: usize = 64;
+    if frame.rdi > u32::MAX as u64
+        || frame.rsi > usize::MAX as u64
+        || frame.rdx > usize::MAX as u64
+        || frame.r8 > MAX_TEXT as u64
+        || frame.r9 > 0x00ff_ffff
+    {
+        return SYS_ERR_EINVAL;
+    }
+    let length = frame.r8 as usize;
+    let mut text = [0u8; MAX_TEXT];
+    if length > 0
+        && crate::tasking::scheduler::copy_from_current_user(frame.r10, &mut text[..length])
+            .is_err()
+    {
+        return SYS_ERR_EFAULT;
+    }
+    let owner = crate::tasking::scheduler::current_task_id()
+        .map(|task| task.get())
+        .unwrap_or(0);
+    let color = (
+        ((frame.r9 >> 16) & 0xff) as u8,
+        ((frame.r9 >> 8) & 0xff) as u8,
+        (frame.r9 & 0xff) as u8,
+    );
+    if crate::gui::draw_window_text(
+        owner,
+        frame.rdi as u32,
+        frame.rsi as usize,
+        frame.rdx as usize,
+        &text[..length],
         color,
     ) {
         0
@@ -908,7 +961,8 @@ pub unsafe fn initialize(kernel_stack_top: VirtAddr) {
         let star = (user_code_base << 48) | (u64::from(gdt::KERNEL_CODE_SELECTOR) << 32);
         let lstar = leafos_syscall_entry as *const () as usize as u64;
         unsafe {
-            install_cpu_local(0).expect("bootstrap CPU-local slot is valid");
+            let cpu_index = current_cpu_index();
+            install_cpu_local(cpu_index).expect("current CPU-local slot is valid");
             x86::msr::wrmsr(IA32_KERNEL_GSBASE, 0);
         }
         set_kernel_stack(kernel_stack_top);
@@ -919,6 +973,19 @@ pub unsafe fn initialize(kernel_stack_top: VirtAddr) {
             x86::msr::wrmsr(IA32_FMASK, 0x74700);
         }
     });
+}
+
+pub fn current_cpu_index() -> usize {
+    let base = unsafe { x86::msr::rdmsr(IA32_GS_BASE) } as usize;
+    let locals = addr_of_mut!(LEAFOS_CPU_LOCALS) as *mut CpuLocal as usize;
+    let offset = base.wrapping_sub(locals);
+    if offset % core::mem::size_of::<CpuLocal>() == 0 {
+        let index = offset / core::mem::size_of::<CpuLocal>();
+        if index < MAX_CPUS {
+            return index;
+        }
+    }
+    0
 }
 
 pub fn set_kernel_stack(stack_top: VirtAddr) {
@@ -947,6 +1014,7 @@ pub unsafe fn install_cpu_local(cpu_index: usize) -> Result<(), ()> {
     }
     let locals = addr_of_mut!(LEAFOS_CPU_LOCALS) as *mut CpuLocal;
     let local = unsafe { locals.add(cpu_index) };
+    unsafe { (*local).cpu_index = cpu_index as u64 };
     unsafe {
         x86::msr::wrmsr(IA32_GS_BASE, local as u64);
     }

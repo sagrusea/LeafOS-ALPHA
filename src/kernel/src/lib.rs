@@ -19,6 +19,7 @@ pub mod gui;
 pub mod memory;
 pub mod misc;
 pub mod shell;
+pub mod smp;
 pub mod sync;
 pub mod tasking;
 pub mod time;
@@ -93,8 +94,11 @@ pub fn exit_qemu(exit_code: QemuExitCode) {
 
 pub fn shutdown() -> ! {
     x86_64::instructions::interrupts::disable();
+    serial_println!("[INFO] Requesting ACPI S5 shutdown");
     unsafe {
-        outw(0x604, 0x2000);
+        outw(0x604, 0x3400);
+        outw(0xb004, 0x2000);
+        outw(0x4004, 0x3400);
     }
     hlt_loop()
 }
@@ -106,6 +110,14 @@ pub fn init() {
     if apic_enabled {
         unsafe { interrupts::PICS.lock().disable() };
         serial_println!("[OK] Local APIC and I/O APIC enabled; legacy PIC masked");
+        if let Some(apic_id) = drivers::apic::current_apic_id() {
+            let cpu_index = drivers::acpi::processor_index(apic_id).unwrap_or(0);
+            serial_println!(
+                "[OK] Bootstrap CPU APIC ID={} topology index={}",
+                apic_id,
+                cpu_index
+            );
+        }
     } else {
         unsafe { interrupts::PICS.lock().initialize() };
         serial_println!("[WARN] APIC unavailable; using legacy PIC");

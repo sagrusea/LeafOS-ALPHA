@@ -47,6 +47,15 @@ pub fn info() -> Option<ApicInfo> {
     APIC_INFO.get().copied().flatten()
 }
 
+pub fn processor_ids() -> Option<&'static [u32]> {
+    let info = APIC_INFO.get()?.as_ref()?;
+    Some(&info.processor_ids[..info.processor_count])
+}
+
+pub fn processor_index(apic_id: u32) -> Option<usize> {
+    processor_ids()?.iter().position(|&id| id == apic_id)
+}
+
 unsafe fn parse(rsdp: u64, physical_offset: u64) -> Option<ApicInfo> {
     if rsdp == 0 {
         return None;

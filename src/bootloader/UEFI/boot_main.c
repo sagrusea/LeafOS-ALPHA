@@ -652,6 +652,54 @@ static EFI_STATUS BuildPhysicalMemoryMapping(void)
     return EFI_OUT_OF_RESOURCES;
 }
 
+static EFI_STATUS MapIdentityTrampolinePage(void)
+{
+    EFI_STATUS Status;
+    UINT64 *Level4 = (UINT64 *)(UINTN)gKernelPageTableRoot;
+    UINT64 *Level3;
+    UINT64 *Level2;
+    UINT64 *Level1;
+    EFI_PHYSICAL_ADDRESS NewPage;
+
+    if ((Level4[0] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+        Status = AllocateZeroedPage(&NewPage);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        Level4[0] = (NewPage & PAGE_TABLE_ADDRESS_MASK)
+            | PAGE_TABLE_ENTRY_PRESENT | PAGE_TABLE_ENTRY_WRITABLE;
+    }
+
+    Level3 = (UINT64 *)(UINTN)(Level4[0] & PAGE_TABLE_ADDRESS_MASK);
+    if ((Level3[0] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+        Status = AllocateZeroedPage(&NewPage);
+        if (EFI_ERROR(Status)) {
+            return Status;
+        }
+        Level3[0] = (NewPage & PAGE_TABLE_ADDRESS_MASK)
+            | PAGE_TABLE_ENTRY_PRESENT | PAGE_TABLE_ENTRY_WRITABLE;
+    }
+    if ((Level3[0] & PAGE_TABLE_ENTRY_HUGE) != 0) {
+        Level3[0] &= ~PAGE_TABLE_ENTRY_NO_EXECUTE;
+        return EFI_SUCCESS;
+    }
+
+    Level2 = (UINT64 *)(UINTN)(Level3[0] & PAGE_TABLE_ADDRESS_MASK);
+    if ((Level2[0] & PAGE_TABLE_ENTRY_PRESENT) == 0) {
+        Level2[0] = PAGE_TABLE_ENTRY_PRESENT
+            | PAGE_TABLE_ENTRY_WRITABLE | PAGE_TABLE_ENTRY_HUGE;
+        return EFI_SUCCESS;
+    }
+    if ((Level2[0] & PAGE_TABLE_ENTRY_HUGE) != 0) {
+        Level2[0] &= ~PAGE_TABLE_ENTRY_NO_EXECUTE;
+        return EFI_SUCCESS;
+    }
+
+    Level1 = (UINT64 *)(UINTN)(Level2[0] & PAGE_TABLE_ADDRESS_MASK);
+    Level1[9] = 0x9000 | PAGE_TABLE_ENTRY_PRESENT | PAGE_TABLE_ENTRY_WRITABLE;
+    return EFI_SUCCESS;
+}
+
 static EFI_STATUS CloneActivePageTables(EFI_PHYSICAL_ADDRESS *NewRoot)
 {
     EFI_STATUS Status;
@@ -686,6 +734,11 @@ static EFI_STATUS CloneActivePageTables(EFI_PHYSICAL_ADDRESS *NewRoot)
         gKernelPageTableRoot,
         4
     );
+    if (EFI_ERROR(Status)) {
+        return Status;
+    }
+
+    Status = MapIdentityTrampolinePage();
     if (EFI_ERROR(Status)) {
         return Status;
     }
@@ -861,12 +914,51 @@ static VOID GetFramebufferInfo(BootInfo *Info)
     EFI_STATUS Status;
     EFI_GUID GopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
     EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
+    UINT32 BestMode = 0;
+    UINT32 BestWidth = 0;
+    UINT32 BestHeight = 0;
+    UINT32 Mode;
 
     Status = gBS->LocateProtocol(&GopGuid, NULL, (VOID **)&Gop);
 
     if (EFI_ERROR(Status) || !Gop || !Gop->Mode || !Gop->Mode->Info) {
         PrintAscii("[WARN] Graphics Output Protocol not available -- no framebuffer\r\n");
         return;
+    }
+
+    /*
+     * OVMF often starts Virtio-GPU at a conservative mode. Select the
+     * largest RGB/BGR mode offered by GOP, capped at QHD so the software
+     * renderer does not request an unexpectedly large framebuffer.
+     */
+    for (Mode = 0; Mode < Gop->Mode->MaxMode; ++Mode) {
+        UINTN SizeOfInfo = 0;
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *ModeInfo = NULL;
+
+        Status = Gop->QueryMode(Gop, Mode, &SizeOfInfo, &ModeInfo);
+        if (EFI_ERROR(Status) || !ModeInfo) {
+            continue;
+        }
+        if ((ModeInfo->PixelFormat == PixelRedGreenBlueReserved8BitPerColor ||
+             ModeInfo->PixelFormat == PixelBlueGreenRedReserved8BitPerColor) &&
+            ModeInfo->HorizontalResolution <= 2560 &&
+            ModeInfo->VerticalResolution <= 1440 &&
+            ((UINT64)ModeInfo->HorizontalResolution * ModeInfo->VerticalResolution >
+             (UINT64)BestWidth * BestHeight)) {
+            BestMode = Mode;
+            BestWidth = ModeInfo->HorizontalResolution;
+            BestHeight = ModeInfo->VerticalResolution;
+        }
+        gBS->FreePool(ModeInfo);
+    }
+
+    if (BestWidth != 0 &&
+        (Gop->Mode->Mode != BestMode || Gop->Mode->Info->HorizontalResolution != BestWidth ||
+         Gop->Mode->Info->VerticalResolution != BestHeight)) {
+        Status = Gop->SetMode(Gop, BestMode);
+        if (EFI_ERROR(Status)) {
+            PrintAscii("[WARN] Unable to select the largest GOP mode\r\n");
+        }
     }
 
     Info->FramebufferBase             = (UINT64)Gop->Mode->FrameBufferBase;
