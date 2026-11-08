@@ -248,6 +248,10 @@ pub unsafe fn initialize(boot_info: &'static BootInfo) -> Result<(), FsError> {
         .map_err(|error| *error)
 }
 
+pub fn is_initialized() -> bool {
+    ARCHIVE.get().is_some_and(|archive| archive.is_ok())
+}
+
 fn archive() -> Result<&'static [u8], FsError> {
     ARCHIVE
         .get()

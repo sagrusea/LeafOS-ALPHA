@@ -1,0 +1,3 @@
+LeafOS initrd directories are available.
+
+Try: cd docs, ls, cat ABOUT.TXT, and pwd.

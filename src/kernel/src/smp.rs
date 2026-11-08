@@ -2,7 +2,7 @@ use crate::arch::syscall;
 use crate::drivers::{acpi, apic};
 use alloc::boxed::Box;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::registers::control::Cr3;
 
 const TRAMPOLINE_BASE: usize = 0x9000;
@@ -17,13 +17,15 @@ const AP_STACK_SIZE: usize = 32 * 1024;
 const AP_DOUBLE_FAULT_STACK_SIZE: usize = 8 * 1024;
 const AP_START_TIMEOUT_TICKS: u64 = 10;
 
-static AP_READY: [AtomicU64; syscall::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; syscall::MAX_CPUS];
+static AP_READY: [AtomicU64; syscall::MAX_CPUS] = [const { AtomicU64::new(0) }; syscall::MAX_CPUS];
 static APIC_IDS: [AtomicU64; syscall::MAX_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; syscall::MAX_CPUS];
 static AP_STACK_TOPS: [AtomicU64; syscall::MAX_CPUS] =
     [const { AtomicU64::new(0) }; syscall::MAX_CPUS];
+static RESCHEDULE_PENDING: [AtomicBool; syscall::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; syscall::MAX_CPUS];
 static STARTUP_COMPLETE: AtomicU64 = AtomicU64::new(0);
+static BSP_APIC_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 
 global_asm!(
     r#"
@@ -102,6 +104,8 @@ pub fn start_secondaries() -> usize {
     let Some(bsp_id) = apic::current_apic_id() else {
         return 0;
     };
+    BSP_APIC_ID.store(u64::from(bsp_id), Ordering::Release);
+    AP_READY[0].store(2, Ordering::Release);
     crate::serial_println!(
         "[INFO] SMP topology: BSP APIC ID={}, processors={:?}",
         bsp_id,
@@ -121,10 +125,7 @@ pub fn start_secondaries() -> usize {
                 cpu_index
             );
         } else {
-            crate::serial_println!(
-                "[WARN] Secondary CPU APIC ID={} failed to start",
-                apic_id
-            );
+            crate::serial_println!("[WARN] Secondary CPU APIC ID={} failed to start", apic_id);
         }
         cpu_index += 1;
     }
@@ -159,9 +160,9 @@ fn start_secondary(index: usize, apic_id: u32) -> bool {
         patch(TRAMPOLINE_CR3)
             .cast::<u64>()
             .write_unaligned(Cr3::read().0.start_address().as_u64());
-        patch(TRAMPOLINE_ENTRY).cast::<u64>().write_unaligned(
-            leafos_secondary_entry as *const () as usize as u64,
-        );
+        patch(TRAMPOLINE_ENTRY)
+            .cast::<u64>()
+            .write_unaligned(leafos_secondary_entry as *const () as usize as u64);
         patch(TRAMPOLINE_STACK)
             .cast::<u64>()
             .write_unaligned(stack_top as u64);
@@ -217,21 +218,67 @@ fn wait_for_ap(index: usize, timeout_ticks: u64) -> bool {
 
 pub fn wake_secondaries() {
     let current_cpu = syscall::current_cpu_index();
-    for (cpu_index, apic_id) in APIC_IDS.iter().enumerate().skip(1) {
-        if cpu_index == current_cpu
-            || AP_READY[cpu_index].load(Ordering::Acquire) != 2
-        {
-            continue;
-        }
-        let apic_id = apic_id.load(Ordering::Acquire);
-        if apic_id != u64::MAX && !apic::send_reschedule_ipi(apic_id as u32) {
-            crate::serial_println!(
-                "[WARN] Could not notify secondary CPU {} (APIC ID {})",
-                cpu_index,
-                apic_id
-            );
+    for cpu_index in 1..syscall::MAX_CPUS {
+        if cpu_index != current_cpu {
+            wake_cpu(cpu_index);
         }
     }
+}
+
+pub fn wake_cpu(cpu_index: usize) -> bool {
+    if cpu_index == 0
+        || cpu_index == syscall::current_cpu_index()
+        || AP_READY
+            .get(cpu_index)
+            .is_none_or(|ready| ready.load(Ordering::Acquire) != 2)
+    {
+        return false;
+    }
+    let apic_id = APIC_IDS[cpu_index].load(Ordering::Acquire);
+    if apic_id == u64::MAX {
+        return false;
+    }
+    if RESCHEDULE_PENDING[cpu_index]
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    if !apic::send_reschedule_ipi(apic_id as u32) {
+        RESCHEDULE_PENDING[cpu_index].store(false, Ordering::Release);
+        crate::serial_println!(
+            "[WARN] Could not notify secondary CPU {} (APIC ID {})",
+            cpu_index,
+            apic_id
+        );
+        return false;
+    }
+    true
+}
+
+pub fn reschedule_ipi_received() {
+    let cpu_index = syscall::current_cpu_index();
+    if let Some(pending) = RESCHEDULE_PENDING.get(cpu_index) {
+        pending.store(false, Ordering::Release);
+    }
+}
+
+pub fn cpu_index_for_apic_id(apic_id: u32) -> Option<usize> {
+    if BSP_APIC_ID.load(Ordering::Acquire) == u64::from(apic_id) {
+        return Some(0);
+    }
+    APIC_IDS
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, id)| (id.load(Ordering::Acquire) == u64::from(apic_id)).then_some(index))
+}
+
+pub fn cpu_is_online(cpu_index: usize) -> bool {
+    cpu_index == 0
+        || AP_READY
+            .get(cpu_index)
+            .is_some_and(|ready| ready.load(Ordering::Acquire) == 2)
 }
 
 #[inline(never)]
@@ -250,8 +297,8 @@ extern "C" fn leafos_secondary_entry(index: u32) -> ! {
         crate::hlt_loop();
     }
     let double_fault_stack = Box::leak(Box::new([0u8; AP_DOUBLE_FAULT_STACK_SIZE]));
-    let double_fault_stack_top = (double_fault_stack.as_ptr() as usize
-        + AP_DOUBLE_FAULT_STACK_SIZE) as u64;
+    let double_fault_stack_top =
+        (double_fault_stack.as_ptr() as usize + AP_DOUBLE_FAULT_STACK_SIZE) as u64;
     crate::gdt::init_secondary(
         index,
         x86_64::VirtAddr::new(double_fault_stack_top),
@@ -260,13 +307,26 @@ extern "C" fn leafos_secondary_entry(index: u32) -> ! {
     crate::serial_println!("[INFO] AP {} loaded its GDT/TSS", index);
     crate::arch::interrupts::init_idt();
     crate::serial_println!("[INFO] AP {} loaded the IDT", index);
-    if unsafe { syscall::install_cpu_local(index) }.is_err()
-        || !apic::initialize_secondary_local()
+    if unsafe { syscall::install_cpu_local(index) }.is_err() || !apic::initialize_secondary_local()
     {
         crate::serial_println!("[FATAL] Secondary CPU {} initialization failed", index);
         crate::hlt_loop();
     }
+    let apic_id = apic::current_apic_id();
+    let mapped_index = apic_id.and_then(cpu_index_for_apic_id);
+    if mapped_index != Some(index) {
+        crate::serial_println!(
+            "[FATAL] Secondary CPU topology mismatch: GS index={}, APIC ID={:?}, mapped index={:?}",
+            index,
+            apic_id,
+            mapped_index
+        );
+        crate::hlt_loop();
+    }
     crate::serial_println!("[INFO] AP {} enabled local APIC", index);
+    // IDT, GS-based CPU state, and the local APIC are ready before the AP is
+    // advertised online. A reschedule IPI before run_secondary is safe while
+    // this CPU has no current scheduler task.
     x86_64::instructions::interrupts::enable();
     AP_READY[index].store(2, Ordering::Release);
     crate::serial_println!("[OK] Secondary CPU {} online", index);

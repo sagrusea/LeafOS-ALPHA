@@ -6,9 +6,12 @@
 #![reexport_test_harness_main = "test_main"]
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::boot_info::BootInfo;
 use kernel::framebuffer::{self, FramebufferInfo};
 use kernel::{gop_println, serial_println};
+
+static PANIC_LOCK: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
@@ -28,10 +31,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         kernel::hlt_loop();
     }
     serial_println!("[OK] Physical memory manager initialized");
-    kernel::drivers::acpi::initialize(
-        boot_info.acpi_rsdp,
-        boot_info.physical_memory_offset,
-    );
+    kernel::drivers::acpi::initialize(boot_info.acpi_rsdp, boot_info.physical_memory_offset);
     if let Some(info) = kernel::drivers::acpi::info() {
         serial_println!(
             "[OK] ACPI MADT: {} enabled processor(s), LAPIC={:#x}, IOAPIC={:#x}",
@@ -89,7 +89,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     serial_println!("[OK] Essential kernel startup complete");
     serial_println!("[INFO] Starting shell as a scheduled kernel task");
 
-    let shell_task = match kernel::scheduler::spawn(shell_service) {
+    let shell_task = match kernel::scheduler::spawn(kernel::shell::run_service_task) {
         Ok(task) => task,
         Err(error) => {
             serial_println!("[FATAL] Failed to schedule shell task: {:?}", error);
@@ -119,28 +119,25 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     kernel::hlt_loop();
 }
 
-fn shell_service() {
-    if kernel::framebuffer::is_initialized() {
-        let Some(owner) = kernel::scheduler::current_task_id() else {
-            serial_println!("[FATAL] Shell task has no scheduler owner");
-            kernel::scheduler::exit_current();
-        };
-        if kernel::gui::open_terminal_window(owner.get()).is_none() {
-            serial_println!("[FATAL] Could not create the shell terminal window");
-            kernel::scheduler::exit_current();
-        }
-    }
-    kernel::shell::run()
-}
-
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    if PANIC_LOCK
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        x86_64::instructions::interrupts::disable();
+        loop {
+            x86_64::instructions::hlt();
+        }
+    }
+
+    kernel::drivers::apic::panic_stop_other_cpus();
     serial_println!("--Kernel Panic--");
-    serial_println!("{}", info.message());
+    serial_println!("{}", info);
     if framebuffer::is_initialized() {
         gop_println!("--KERNEL PANIC--");
-        gop_println!("{}", info.message());
+        gop_println!("{}", info);
     }
     kernel::hlt_loop();
 }

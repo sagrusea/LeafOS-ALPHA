@@ -1,3 +1,4 @@
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -212,10 +213,7 @@ enum Command<'a> {
     SetColor(&'a [u8]),
     SetResolution(&'a [u8]),
     SetMouseInverse,
-    Info,
-    InfoOs,
-    InfoHardware,
-    InfoSoftware,
+    Info(Option<&'a [u8]>),
     Processes,
     Kill(&'a [u8]),
     Shutdown,
@@ -323,7 +321,10 @@ fn parse_command(line: &[u8]) -> Command<'_> {
         return Command::PrintWorkingDirectory;
     }
     if line.eq_ignore_ascii_case(b"info") {
-        return Command::Info;
+        return Command::Info(None);
+    }
+    if let Some(argument) = strip_command_arguments(line, b"info") {
+        return Command::Info(Some(argument));
     }
     if line.eq_ignore_ascii_case(b"ps") || line.eq_ignore_ascii_case(b"processes") {
         return Command::Processes;
@@ -351,18 +352,6 @@ fn parse_command(line: &[u8]) -> Command<'_> {
             return Command::SetMouseInverse;
         }
         return Command::Settings;
-    }
-    if let Some(value) = strip_command_arguments(line, b"info") {
-        let (target, _) = split_first_word(value);
-        if target.eq_ignore_ascii_case(b"-os") {
-            return Command::InfoOs;
-        }
-        if target.eq_ignore_ascii_case(b"-hw") {
-            return Command::InfoHardware;
-        }
-        if target.eq_ignore_ascii_case(b"-sw") {
-            return Command::InfoSoftware;
-        }
     }
     if line.eq_ignore_ascii_case(b"echo") {
         return Command::Echo(&[]);
@@ -885,22 +874,36 @@ fn edit_disk_file(name: &str) {
 fn print_process_list() {
     let tasks = crate::scheduler::task_snapshot();
     let mut count = 0;
-    gop_println!("ID   PARENT  STATE       EXIT  TYPE");
+    gop_println!(
+        "{:>5}  {:>8}  {:<12}  {:>8}  TYPE",
+        "ID",
+        "PARENT",
+        "STATE",
+        "EXIT"
+    );
     for task in tasks.into_iter().flatten() {
         count += 1;
+        let state = match task.state {
+            crate::scheduler::TaskState::Ready => "Ready",
+            crate::scheduler::TaskState::Running => "Running",
+            crate::scheduler::TaskState::Blocked => "Blocked",
+            crate::scheduler::TaskState::Sleeping => "Sleeping",
+            crate::scheduler::TaskState::Terminated => "Terminated",
+        };
+        let task_type = if task.is_idle {
+            "idle"
+        } else if task.is_user {
+            "user app"
+        } else {
+            "kernel task"
+        };
         gop_println!(
-            "{:>3}  {:>6}  {:<11?} {:>4?}  {}",
+            "{:>5}  {:>8}  {:<12}  {:>8?}  {}",
             task.id.get(),
             task.parent.map_or(0, |parent| parent.get()),
-            task.state,
+            state,
             task.exit_code,
-            if task.is_idle {
-                "idle"
-            } else if task.is_user {
-                "user app"
-            } else {
-                "kernel task"
-            }
+            task_type
         );
     }
     gop_println!("{} scheduled task(s).", count);
@@ -917,7 +920,7 @@ fn launch_app(
     command_arguments: &[u8],
     current_dir: &[u8],
     use_ext2: bool,
-    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+    running_apps: &mut [Option<RunningApp>],
 ) {
     let Some(slot) = running_apps.iter().position(Option::is_none) else {
         gop_println!("App tracking is full; wait for an app to finish.");
@@ -1104,7 +1107,7 @@ fn launch_pipeline(
     line: &[u8],
     current_dir: &[u8],
     current_dir_is_ext2: bool,
-    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+    running_apps: &mut [Option<RunningApp>],
 ) {
     let Some(separator) = line.iter().position(|byte| *byte == b'|') else {
         return;
@@ -1294,7 +1297,7 @@ fn pipeline_command<'a>(command: &'a [u8], current_dir_is_ext2: bool) -> (&'a [u
 }
 
 fn report_finished_apps(
-    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+    running_apps: &mut [Option<RunningApp>],
     line: &LineEditor,
     current_dir: &[u8],
     current_dir_is_ext2: bool,
@@ -1354,9 +1357,7 @@ fn report_finished_apps(
     }
 }
 
-fn interrupt_running_apps(
-    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
-) -> bool {
+fn interrupt_running_apps(running_apps: &mut [Option<RunningApp>]) -> bool {
     let mut interrupted = false;
     for app in running_apps.iter().flatten() {
         match crate::scheduler::terminate_task(app.task, 130) {
@@ -1393,15 +1394,15 @@ fn print_hardware_info() {
     gop_println!("Physical address width: {} bits", physical_bits);
 }
 
-fn print_system_info() {
+fn print_system_overview() {
     let (days, hours, minutes, seconds) =
         crate::timer::split_uptime(crate::timer::uptime_seconds());
     let task_count = crate::scheduler::task_snapshot()
         .iter()
         .filter(|task| task.is_some())
         .count();
-    gop_println!("LeafOS kernel v{}", env!("CARGO_PKG_VERSION"));
-    gop_println!("Architecture: x86_64 | firmware: UEFI");
+    gop_println!("System overview");
+    gop_println!("===============");
     gop_println!(
         "Uptime: {}d {:02}:{:02}:{:02}",
         days,
@@ -1418,11 +1419,56 @@ fn print_system_info() {
         task_count,
         crate::scheduler::MAX_TASKS
     );
+}
+
+fn print_os_info() {
+    gop_println!("Operating system");
+    gop_println!("================");
+    gop_println!("Kernel: LeafOS v{}", env!("CARGO_PKG_VERSION"));
+    gop_println!("Architecture: x86_64");
+    gop_println!("Firmware interface: UEFI");
+}
+
+fn print_software_info() {
+    let snapshot = crate::scheduler::task_snapshot();
+    let (mut ready, mut running, mut blocked, mut sleeping) = (0, 0, 0, 0);
+    for task in snapshot.iter().flatten().filter(|task| !task.is_idle) {
+        match task.state {
+            crate::scheduler::TaskState::Ready => ready += 1,
+            crate::scheduler::TaskState::Running => running += 1,
+            crate::scheduler::TaskState::Blocked => blocked += 1,
+            crate::scheduler::TaskState::Sleeping => sleeping += 1,
+            crate::scheduler::TaskState::Terminated => {}
+        }
+    }
+    let active = ready + running + blocked + sleeping;
+    gop_println!("Software state");
+    gop_println!("===============");
     gop_println!(
-        "Timer: {} Hz PIT | filesystems: read-only initrd, ext2 data disk",
+        "Scheduler: {} active task(s) ({} ready, {} running, {} blocked, {} sleeping)",
+        active,
+        ready,
+        running,
+        blocked,
+        sleeping
+    );
+    gop_println!(
+        "Scheduler: round-robin, timer at {} Hz",
         crate::timer::TICKS_PER_SECOND
     );
-    print_hardware_info();
+    gop_println!(
+        "Filesystems: initrd {}, ext2 data disk {}",
+        if crate::fs::is_initialized() {
+            "mounted"
+        } else {
+            "unavailable"
+        },
+        if crate::fs::ext2::is_initialized() {
+            "mounted"
+        } else {
+            "unavailable"
+        }
+    );
 }
 
 fn execute(
@@ -1430,7 +1476,7 @@ fn execute(
     current_dir: &mut [u8; PATH_CAPACITY],
     current_dir_len: &mut usize,
     current_dir_is_ext2: &mut bool,
-    running_apps: &mut [Option<RunningApp>; crate::scheduler::MAX_TASKS],
+    running_apps: &mut [Option<RunningApp>],
 ) {
     let mut terminal_batch_owner = crate::scheduler::current_task_id()
         .map(|task| task.get())
@@ -1894,28 +1940,13 @@ fn execute(
                 gop_println!("Usage: set res <width>:<height>");
             }
         }
-        Command::Info => print_system_info(),
-        Command::InfoOs => {
-            gop_println!("LeafOS kernel v{}", env!("CARGO_PKG_VERSION"));
-            gop_println!("Architecture: x86_64");
-            gop_println!("Firmware interface: UEFI");
-            gop_println!("Kernel uptime: {} seconds", crate::timer::uptime_seconds());
-        }
-        Command::InfoHardware => print_hardware_info(),
-        Command::InfoSoftware => {
-            gop_println!("Kernel: LeafOS v{}", env!("CARGO_PKG_VERSION"));
-            gop_println!("Shell: built-in kernel task");
-            gop_println!(
-                "Scheduler: round-robin, preempted at {} Hz",
-                crate::timer::TICKS_PER_SECOND
-            );
-            gop_println!(
-                "Task limit: {} scheduled tasks",
-                crate::scheduler::MAX_TASKS
-            );
-            gop_println!("Memory: linked-list heap with demand mapping");
-            gop_println!("Storage: read-only initrd and ext2 data disk");
-        }
+        Command::Info(argument) => match argument {
+            None => print_system_overview(),
+            Some(argument) if argument.eq_ignore_ascii_case(b"-os") => print_os_info(),
+            Some(argument) if argument.eq_ignore_ascii_case(b"-hw") => print_hardware_info(),
+            Some(argument) if argument.eq_ignore_ascii_case(b"-sw") => print_software_info(),
+            Some(_) => gop_println!("Usage: info [-os|-hw|-sw]"),
+        },
         Command::Shutdown => {
             gop_println!("Shutting down...");
             if let Some(owner) = terminal_batch_owner.take() {
@@ -1943,7 +1974,7 @@ fn print_prompt(current_dir: &[u8], current_dir_is_ext2: bool) {
     crate::framebuffer::begin_input_line();
 }
 
-fn running_app_count(running_apps: &[Option<RunningApp>; crate::scheduler::MAX_TASKS]) -> usize {
+fn running_app_count(running_apps: &[Option<RunningApp>]) -> usize {
     running_apps.iter().filter(|app| app.is_some()).count()
 }
 
@@ -1953,18 +1984,33 @@ pub fn run() -> ! {
     let mut current_dir = [0; PATH_CAPACITY];
     let mut current_dir_len = 0;
     let mut current_dir_is_ext2 = false;
-    let mut running_apps = [None; crate::scheduler::MAX_TASKS];
+    let mut running_apps = vec![None; crate::scheduler::MAX_TASKS];
     gop_println!("LeafOS shell. Type 'help' for commands.");
     print_prompt(&current_dir[..current_dir_len], current_dir_is_ext2);
 
     loop {
+        if crate::framebuffer::is_initialized()
+            && let Some(owner) = crate::scheduler::current_task_id().map(|task| task.get())
+            && !crate::gui::terminal_is_visible(owner)
+        {
+            crate::scheduler::exit_current_with_code(0);
+        }
         report_finished_apps(
             &mut running_apps,
             &line,
             &current_dir[..current_dir_len],
             current_dir_is_ext2,
         );
-        let key = dequeue_key();
+        let service_owner = crate::scheduler::current_task_id()
+            .map(|task| task.get())
+            .filter(|owner| crate::gui::terminal_is_visible(*owner));
+        if service_owner.is_some() {
+            crate::gui::refresh_top_bar_if_due();
+        }
+        let key = match service_owner {
+            Some(owner) => crate::gui::poll_terminal_key(owner),
+            None => dequeue_key(),
+        };
         match key {
             Some(KEY_PAGE_UP) => {
                 crate::framebuffer::scrollback_page_up();
@@ -2074,6 +2120,24 @@ pub fn run() -> ! {
     }
 }
 
+pub fn run_service() -> ! {
+    if crate::framebuffer::is_initialized() {
+        let Some(owner) = crate::scheduler::current_task_id() else {
+            crate::serial_println!("[FATAL] Shell task has no scheduler owner");
+            crate::scheduler::exit_current();
+        };
+        if crate::gui::open_terminal_window(owner.get()).is_none() {
+            crate::serial_println!("[FATAL] Could not create the shell terminal window");
+            crate::scheduler::exit_current();
+        }
+    }
+    run()
+}
+
+pub fn run_service_task() {
+    run_service()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2173,10 +2237,14 @@ mod tests {
             parse_command(b"set res 1024:768"),
             Command::SetResolution(b"1024:768")
         );
-        assert_eq!(parse_command(b"info"), Command::Info);
-        assert_eq!(parse_command(b"info -os"), Command::InfoOs);
-        assert_eq!(parse_command(b"info -hw"), Command::InfoHardware);
-        assert_eq!(parse_command(b"info -sw"), Command::InfoSoftware);
+        assert_eq!(parse_command(b"info"), Command::Info(None));
+        assert_eq!(parse_command(b"info -os"), Command::Info(Some(b"-os")));
+        assert_eq!(parse_command(b"info -hw"), Command::Info(Some(b"-hw")));
+        assert_eq!(parse_command(b"info -sw"), Command::Info(Some(b"-sw")));
+        assert_eq!(
+            parse_command(b"info -unknown"),
+            Command::Info(Some(b"-unknown"))
+        );
         assert_eq!(parse_command(b"ps"), Command::Processes);
         assert_eq!(parse_command(b"processes"), Command::Processes);
         assert_eq!(parse_command(b"kill 12"), Command::Kill(b"12"));

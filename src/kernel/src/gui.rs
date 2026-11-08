@@ -1,6 +1,7 @@
 use crate::framebuffer;
 use crate::sync::{Mutex, Once};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 const MAX_WINDOWS: usize = 8;
 const EVENT_CAPACITY: usize = 64;
@@ -10,18 +11,36 @@ const MAX_TEXT_BYTES: usize = 64;
 const TERMINAL_ROWS: usize = 256;
 const TERMINAL_COLUMNS: usize = 80;
 const TERMINAL_CELL_WIDTH: usize = 9;
+const KEY_BUFFER_CAPACITY: usize = 256;
 const DEFAULT_TERMINAL_TEXT: (u8, u8, u8) = (220, 235, 245);
 const MIN_WINDOW_WIDTH: usize = 200;
 const MIN_WINDOW_HEIGHT: usize = 150;
 const RESIZE_GRIP_SIZE: usize = 12;
+const TERMINAL_LINE_STRIDE: usize = 20;
+const DOCK_WIDTH: usize = 400;
+const DOCK_HEIGHT: usize = 48;
+const DOCK_BOTTOM_OFFSET: usize = 64;
+const DOCK_BUTTON_MARGIN: usize = 16;
+const DOCK_BUTTON_GAP: usize = 8;
 
 const DESKTOP: (u8, u8, u8) = (18, 30, 48);
 const PANEL: (u8, u8, u8) = (28, 44, 68);
 const CARD: (u8, u8, u8) = (38, 58, 86);
+const DOCK: (u8, u8, u8) = (64, 72, 82);
+const DOCK_BUTTON: (u8, u8, u8) = (82, 92, 104);
 const ACCENT: (u8, u8, u8) = (80, 190, 160);
 const TEXT: (u8, u8, u8) = (235, 245, 255);
 const MUTED: (u8, u8, u8) = (160, 180, 200);
-const STATUS_BAR_HEIGHT: usize = 34;
+const STATUS_BAR_HEIGHT: usize = 32;
+
+static LAST_TOP_BAR_SECOND: AtomicU64 = AtomicU64::new(u64::MAX);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DockAction {
+    Terminal,
+    Edit,
+    Info,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GuiEvent {
@@ -51,6 +70,53 @@ pub struct Window {
     text_count: usize,
     terminal: bool,
     terminal_buffer: TerminalBuffer,
+    key_buffer: TerminalKeyBuffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalKeyBuffer {
+    bytes: [u8; KEY_BUFFER_CAPACITY],
+    head: usize,
+    length: usize,
+}
+
+impl TerminalKeyBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; KEY_BUFFER_CAPACITY],
+            head: 0,
+            length: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.length == KEY_BUFFER_CAPACITY {
+            return;
+        }
+        let tail = (self.head + self.length) % KEY_BUFFER_CAPACITY;
+        self.bytes[tail] = byte;
+        self.length += 1;
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        if bytes.len() > KEY_BUFFER_CAPACITY.saturating_sub(self.length) {
+            return false;
+        }
+        for byte in bytes.iter().copied() {
+            self.push(byte);
+        }
+        true
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.length == 0 {
+            return None;
+        }
+        let byte = self.bytes[self.head];
+        self.head = (self.head + 1) % KEY_BUFFER_CAPACITY;
+        self.length -= 1;
+        Some(byte)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -324,6 +390,7 @@ impl Window {
             text_count: 0,
             terminal: false,
             terminal_buffer: TerminalBuffer::new(),
+            key_buffer: TerminalKeyBuffer::new(),
         }
     }
 
@@ -451,6 +518,44 @@ impl GuiState {
         self.event_length += 1;
     }
 
+    fn focused_window_slot(&self) -> Option<usize> {
+        let id = self.focused?;
+        self.windows
+            .iter()
+            .position(|window| window.visible && window.id == id)
+    }
+
+    fn push_focused_key(&mut self, byte: u8) -> bool {
+        if !self.active {
+            return false;
+        }
+        let Some(slot) = self.focused_window_slot() else {
+            return true;
+        };
+        let owner = self.windows[slot].owner;
+        if self.windows[slot].terminal {
+            self.windows[slot].key_buffer.push(byte);
+        }
+        self.push_event(owner, GuiEvent::Key(byte));
+        true
+    }
+
+    fn pop_focused_terminal_key(&mut self, owner: u64) -> Option<u8> {
+        if !self.active
+            || !self.focused_window_slot().is_some_and(|slot| {
+                let window = &self.windows[slot];
+                window.terminal && window.owner == owner
+            })
+        {
+            return None;
+        }
+        self.windows
+            .iter_mut()
+            .find(|window| window.terminal && window.visible && window.owner == owner)?
+            .key_buffer
+            .pop()
+    }
+
     fn pop_event(&mut self, owner: u64) -> Option<GuiEvent> {
         if self.event_length == 0 {
             return None;
@@ -496,9 +601,26 @@ impl GuiState {
 }
 
 static GUI: Once<Mutex<GuiState>> = Once::new();
+static CANVAS_LOCK: Mutex<()> = Mutex::new(());
 
 fn state() -> &'static Mutex<GuiState> {
     GUI.call_once(|| Mutex::new(GuiState::new()))
+}
+
+fn focused_title(gui: &GuiState) -> ([u8; 32], usize) {
+    let mut title = [0; 32];
+    let title_length = gui
+        .focused_window_slot()
+        .map(|slot| {
+            let window = &gui.windows[slot];
+            title[..window.title_length].copy_from_slice(&window.title[..window.title_length]);
+            window.title_length
+        })
+        .unwrap_or_else(|| {
+            title[..7].copy_from_slice(b"Desktop");
+            7
+        });
+    (title, title_length)
 }
 
 pub fn initialize() {
@@ -534,21 +656,58 @@ pub fn leave() {
     toggle_cursor(cursor);
 }
 
-pub fn push_key(byte: u8) {
-    let mut gui = state().lock();
-    if gui.active {
-        let owner = gui
-            .focused
-            .and_then(|id| gui.windows.iter().find(|window| window.id == id))
-            .map(|window| window.owner)
-            .unwrap_or(0);
-        gui.push_event(owner, GuiEvent::Key(byte));
-    }
+pub fn push_key(byte: u8) -> bool {
+    state().lock().push_focused_key(byte)
+}
+
+fn bottom_dock_bounds(screen_width: usize, screen_height: usize) -> (usize, usize, usize, usize) {
+    let width = DOCK_WIDTH.min(screen_width);
+    let height = DOCK_HEIGHT.min(screen_height);
+    let x = screen_width.saturating_sub(width) / 2;
+    let y = screen_height.saturating_sub(DOCK_BOTTOM_OFFSET);
+    (x, y, width, height)
+}
+
+fn dock_button_bounds(
+    index: usize,
+    dock: (usize, usize, usize, usize),
+) -> (usize, usize, usize, usize) {
+    let button_width = dock
+        .2
+        .saturating_sub(DOCK_BUTTON_MARGIN * 2 + DOCK_BUTTON_GAP * 2)
+        / 3;
+    let button_height = 32.min(dock.3);
+    let x = dock.0 + DOCK_BUTTON_MARGIN + index * (button_width + DOCK_BUTTON_GAP);
+    let y = dock.1 + dock.3.saturating_sub(button_height) / 2;
+    (x, y, button_width, button_height)
+}
+
+fn point_in_rect(x: i32, y: i32, rect: (usize, usize, usize, usize)) -> bool {
+    x >= 0
+        && y >= 0
+        && (x as usize) >= rect.0
+        && (y as usize) >= rect.1
+        && (x as usize) < rect.0.saturating_add(rect.2)
+        && (y as usize) < rect.1.saturating_add(rect.3)
+}
+
+fn dock_action_at(x: i32, y: i32, screen_width: usize, screen_height: usize) -> Option<DockAction> {
+    let dock = bottom_dock_bounds(screen_width, screen_height);
+    [DockAction::Terminal, DockAction::Edit, DockAction::Info]
+        .into_iter()
+        .enumerate()
+        .find_map(|(index, action)| {
+            point_in_rect(x, y, dock_button_bounds(index, dock)).then_some(action)
+        })
 }
 
 pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
     let (old_cursor, focus_changed, geometry_damage, drag_window_id, effective_wheel_delta);
     let mut scroll_owner = None;
+    let mut close_terminal_owner = None;
+    let mut launch_terminal = false;
+    let mut dock_command_result = None;
+    let mut dock_command_missing_terminal = false;
     {
         let mut gui = state().lock();
         if !gui.active {
@@ -557,11 +716,56 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
         old_cursor = gui.cursor;
         let old_focus = gui.focused;
         let old_buttons = gui.mouse_buttons;
+        let screen = framebuffer::dimensions().unwrap_or((1280, 800));
+        let dock = bottom_dock_bounds(screen.0, screen.1);
+        let pointer_in_top_bar = (0..STATUS_BAR_HEIGHT as i32).contains(&y);
+        let pointer_in_dock = point_in_rect(x, y, dock);
+        let system_layer_pointer = pointer_in_top_bar || pointer_in_dock;
+        let click_started = buttons & 1 != 0 && old_buttons & 1 == 0;
+        let dock_action = if click_started && pointer_in_dock {
+            dock_action_at(x, y, screen.0, screen.1)
+        } else {
+            None
+        };
         gui.cursor = (x, y);
         gui.mouse_buttons = buttons;
         effective_wheel_delta = gui.scroll_delta(wheel_delta);
         let mut damage = None;
-        if buttons & 1 == 0 {
+        if click_started && system_layer_pointer {
+            gui.dragging = None;
+            gui.resizing = None;
+            gui.drag_surface = None;
+            match dock_action {
+                Some(DockAction::Terminal) => launch_terminal = true,
+                Some(action @ (DockAction::Edit | DockAction::Info)) => {
+                    let terminal_slot = gui
+                        .focused_window_slot()
+                        .filter(|&slot| gui.windows[slot].terminal)
+                        .or_else(|| {
+                            gui.z_order.iter().rev().copied().find(|&slot| {
+                                let window = &gui.windows[slot];
+                                window.visible && window.terminal
+                            })
+                        });
+                    if let Some(slot) = terminal_slot {
+                        let command: &[u8] = match action {
+                            DockAction::Edit => b"edit ",
+                            DockAction::Info => b"info\n",
+                            DockAction::Terminal => unreachable!(),
+                        };
+                        let id = gui.windows[slot].id;
+                        let owner = gui.windows[slot].owner;
+                        gui.focused = Some(id);
+                        gui.raise_window(slot);
+                        let queued = gui.windows[slot].key_buffer.push_bytes(command);
+                        dock_command_result = Some((owner, queued));
+                    } else {
+                        dock_command_missing_terminal = true;
+                    }
+                }
+                None => {}
+            }
+        } else if buttons & 1 == 0 {
             gui.dragging = None;
             gui.resizing = None;
             gui.drag_surface = None;
@@ -571,9 +775,9 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
                 .iter_mut()
                 .find(|window| window.visible && window.id == id)
             {
-                let screen = framebuffer::dimensions().unwrap_or((1280, 800));
                 let max_width = screen.0.saturating_sub(window.x).max(1);
-                let max_height = screen.1.saturating_sub(window.y).max(1);
+                let dock_top = bottom_dock_bounds(screen.0, screen.1).1;
+                let max_height = dock_top.saturating_sub(window.y).max(1);
                 let min_width = MIN_WINDOW_WIDTH.min(max_width);
                 let min_height = MIN_WINDOW_HEIGHT.min(max_height);
                 let width = (start_width as i64 + i64::from(x - start_x))
@@ -596,8 +800,18 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
                 .iter_mut()
                 .find(|window| window.visible && window.id == id)
             {
-                let new_x = (x - offset_x).max(0) as usize;
-                let new_y = (y - offset_y).max(42) as usize;
+                let max_x = screen.0.saturating_sub(window.width);
+                let dock_top = bottom_dock_bounds(screen.0, screen.1).1;
+                let max_y = dock_top
+                    .saturating_sub(window.height)
+                    .max(STATUS_BAR_HEIGHT);
+                let new_x =
+                    x.saturating_sub(offset_x)
+                        .clamp(0, max_x.min(i32::MAX as usize) as i32) as usize;
+                let new_y = y.saturating_sub(offset_y).clamp(
+                    STATUS_BAR_HEIGHT as i32,
+                    max_y.min(i32::MAX as usize) as i32,
+                ) as usize;
                 if window.x != new_x || window.y != new_y {
                     let old_geometry = (window.x, window.y, window.width, window.height);
                     window.x = new_x;
@@ -609,19 +823,27 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
             }
         }
 
-        let hit_slot = gui.z_order.iter().rev().copied().find(|&slot| {
-            let window = &gui.windows[slot];
-            window.visible
-                && x >= window.x as i32
-                && y >= window.y as i32
-                && x < window.x.saturating_add(window.width) as i32
-                && y < window.y.saturating_add(window.height) as i32
-        });
+        let hit_slot = (!system_layer_pointer)
+            .then(|| {
+                gui.z_order.iter().rev().copied().find(|&slot| {
+                    let window = &gui.windows[slot];
+                    window.visible
+                        && x >= window.x as i32
+                        && y >= window.y as i32
+                        && x < window.x.saturating_add(window.width) as i32
+                        && y < window.y.saturating_add(window.height) as i32
+                })
+            })
+            .flatten();
         if effective_wheel_delta != 0 {
             if let Some(slot) = hit_slot {
                 let window = &mut gui.windows[slot];
                 if window.terminal {
-                    let rows = window.height.saturating_sub(54).checked_div(8).unwrap_or(0);
+                    let rows = window
+                        .height
+                        .saturating_sub(54)
+                        .checked_div(TERMINAL_LINE_STRIDE)
+                        .unwrap_or(0);
                     let visible_rows = rows.min(TERMINAL_ROWS);
                     if window
                         .terminal_buffer
@@ -633,7 +855,7 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
             }
         }
 
-        if buttons & 1 != 0 && old_buttons & 1 == 0 {
+        if click_started && !system_layer_pointer {
             let hit = hit_slot.map(|slot| gui.windows[slot].id);
             let close_id = hit.and_then(|id| {
                 gui.windows
@@ -655,6 +877,11 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
                     .find(|window| window.id == id)
                     .map(|window| window.owner)
                     .unwrap_or(0);
+                close_terminal_owner = gui
+                    .windows
+                    .iter()
+                    .find(|window| window.id == id && window.terminal)
+                    .map(|window| window.owner);
                 if let Some(window) = gui.windows.iter_mut().find(|window| window.id == id) {
                     window.visible = false;
                 }
@@ -702,21 +929,25 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
             .and_then(|id| gui.windows.iter().find(|window| window.id == id))
             .map(|window| window.owner)
             .unwrap_or(0);
-        gui.push_event(
-            owner,
-            GuiEvent::Mouse {
-                x,
-                y,
-                buttons,
-                wheel_delta: effective_wheel_delta,
-            },
-        );
+        if !system_layer_pointer {
+            gui.push_event(
+                owner,
+                GuiEvent::Mouse {
+                    x,
+                    y,
+                    buttons,
+                    wheel_delta: effective_wheel_delta,
+                },
+            );
+        }
         drag_window_id = gui.dragging.map(|(id, _, _)| id);
     }
     if focus_changed {
-        render_desktop();
+        let _canvas = CANVAS_LOCK.lock();
+        render_desktop_locked();
     } else if let Some((old_geometry, new_geometry)) = geometry_damage {
-        toggle_cursor(old_cursor);
+        let _canvas = CANVAS_LOCK.lock();
+        toggle_cursor_locked(old_cursor);
         let damage = (
             old_geometry.0.min(new_geometry.0),
             old_geometry.1.min(new_geometry.1),
@@ -764,21 +995,63 @@ pub fn push_mouse(x: i32, y: i32, buttons: u8, wheel_delta: i32) {
                 }
             }
         }
-        render_drag_damage(old_geometry, new_geometry, drag_window_id);
+        render_drag_damage_locked(old_geometry, new_geometry, drag_window_id);
         framebuffer::end_frame_with_rect(
             damage.0,
             damage.1,
             damage.2.saturating_sub(damage.0),
             damage.3.saturating_sub(damage.1),
         );
-        toggle_cursor((x, y));
+        toggle_cursor_locked((x, y));
     } else if let Some(owner) = scroll_owner {
-        toggle_cursor(old_cursor);
-        render_terminal_rows(owner, None);
-        toggle_cursor((x, y));
+        let _canvas = CANVAS_LOCK.lock();
+        toggle_cursor_locked(old_cursor);
+        render_terminal_rows_locked(owner, None);
+        toggle_cursor_locked((x, y));
     } else {
-        toggle_cursor(old_cursor);
-        toggle_cursor((x, y));
+        let _canvas = CANVAS_LOCK.lock();
+        toggle_cursor_locked(old_cursor);
+        toggle_cursor_locked((x, y));
+    }
+    if dock_command_missing_terminal {
+        crate::serial_println!("[WARN] Dock shortcut requires an open terminal");
+    }
+    if let Some((owner, queued)) = dock_command_result
+        && !queued
+    {
+        crate::serial_println!(
+            "[WARN] Could not queue dock shortcut in terminal task {}: input buffer is full",
+            owner
+        );
+    }
+    if let Some(owner) = close_terminal_owner
+        && let Err(error) = crate::scheduler::request_terminate_task(
+            crate::scheduler::TaskId::from_raw(owner),
+            0,
+        )
+    {
+        crate::serial_println!(
+            "[WARN] Could not stop closed terminal task {}: {:?}",
+            owner,
+            error
+        );
+    }
+    if launch_terminal {
+        match crate::scheduler::spawn_detached(crate::shell::run_service_task) {
+            Ok(task) => {
+                crate::serial_println!(
+                    "[INFO] Started terminal shell task {} from the dock",
+                    task.get()
+                );
+            }
+            Err(error) => {
+                crate::serial_println!(
+                    "[WARN] Could not start a terminal shell from the dock: {:?}",
+                    error
+                );
+            }
+        }
+        render_desktop();
     }
 }
 
@@ -834,9 +1107,10 @@ pub fn open_terminal_window(owner: u64) -> Option<u32> {
     enable();
     let (screen_width, screen_height) = screen_dimensions();
     let width = 680.min(screen_width.saturating_sub(16)).max(1);
-    let height = 286.min(screen_height.saturating_sub(50)).max(1);
+    let dock_top = bottom_dock_bounds(screen_width, screen_height).1;
+    let y = 54.min(dock_top.saturating_sub(1));
+    let height = 286.min(dock_top.saturating_sub(y)).max(1);
     let x = 32.min(screen_width.saturating_sub(width));
-    let y = 54.min(screen_height.saturating_sub(height));
     let id = {
         let mut gui = state().lock();
         if let Some(window) = gui
@@ -845,6 +1119,7 @@ pub fn open_terminal_window(owner: u64) -> Option<u32> {
             .find(|window| window.terminal && window.owner == owner)
         {
             window.visible = true;
+            window.key_buffer = TerminalKeyBuffer::new();
             window.id
         } else {
             let slot = gui.windows.iter().position(|window| !window.visible)?;
@@ -884,6 +1159,18 @@ pub fn has_terminal(owner: u64) -> bool {
         .any(|window| window.terminal && window.owner == owner)
 }
 
+pub fn terminal_is_visible(owner: u64) -> bool {
+    state()
+        .lock()
+        .windows
+        .iter()
+        .any(|window| window.terminal && window.owner == owner && window.visible)
+}
+
+pub fn poll_terminal_key(owner: u64) -> Option<u8> {
+    state().lock().pop_focused_terminal_key(owner)
+}
+
 pub fn set_terminal_color(owner: u64, color: (u8, u8, u8)) -> bool {
     let mut gui = state().lock();
     let Some(window) = gui
@@ -911,7 +1198,8 @@ pub fn write_terminal(owner: u64, bytes: &[u8]) -> bool {
         };
         let old_line_count = window.terminal_buffer.line_count;
         let (start_row, end_row, scrolled) = window.terminal_buffer.append(bytes);
-        let visible_rows = (window.height.saturating_sub(54) / 8).min(TERMINAL_ROWS);
+        let visible_rows =
+            (window.height.saturating_sub(54) / TERMINAL_LINE_STRIDE).min(TERMINAL_ROWS);
         let full_redraw = scrolled || (old_line_count >= visible_rows && end_row != start_row);
         let buffer = &mut window.terminal_buffer;
         buffer.record_pending_damage((start_row, end_row), full_redraw);
@@ -1170,12 +1458,14 @@ pub fn draw_window_rect(
         };
         if !window.add_rect(x, y, width, height, color) {
             return false;
-        }
-
-        active.then_some((window.x, window.y))
+        };
+        active.then_some((window.x, window.y, gui.cursor))
     };
-    if let Some((window_x, window_y)) = draw {
+    if let Some((window_x, window_y, cursor)) = draw {
+        let _canvas = CANVAS_LOCK.lock();
+        toggle_cursor_locked(cursor);
         framebuffer::draw_rect(window_x + x, window_y + y, width, height, color);
+        toggle_cursor_locked(cursor);
     }
     true
 }
@@ -1216,6 +1506,11 @@ fn render_desktop() {
     if !framebuffer::is_initialized() {
         return;
     }
+    let _canvas = CANVAS_LOCK.lock();
+    render_desktop_locked();
+}
+
+fn render_desktop_locked() {
     state().lock().drag_surface = None;
     framebuffer::begin_frame();
     render_desktop_contents(None, true);
@@ -1223,56 +1518,14 @@ fn render_desktop() {
 }
 
 fn render_desktop_contents(excluded_window: Option<u32>, draw_cursor: bool) {
-    let (focused, cursor, visible_windows) = {
+    let (focused, cursor, focused_title, focused_title_length) = {
         let gui = state().lock();
-        (
-            gui.focused,
-            gui.cursor,
-            gui.windows.iter().filter(|window| window.visible).count(),
-        )
+        let (title, title_length) = focused_title(&gui);
+        (gui.focused, gui.cursor, title, title_length)
     };
     let (screen_width, screen_height) = framebuffer::dimensions().unwrap_or((1280, 800));
-    let uptime = crate::timer::uptime_seconds();
-    let mut uptime_text = [0u8; 32];
-    let uptime_length = format_status(&mut uptime_text, b"Uptime: ", uptime);
-    let mut windows_text = [0u8; 32];
-    let windows_length = format_status(&mut windows_text, b"Windows: ", visible_windows as u64);
-    let focus_text: &[u8] = if focused.is_some() {
-        b"Focused window"
-    } else {
-        b"No focused window"
-    };
 
     framebuffer::draw_rect(0, 0, usize::MAX, usize::MAX, DESKTOP);
-    framebuffer::draw_rect(0, 0, usize::MAX, 42, PANEL);
-    framebuffer::draw_rect(0, 0, 6, 42, ACCENT);
-    framebuffer::draw_text(24, 16, b"LeafOS Desktop", TEXT);
-    framebuffer::draw_text(720, 16, b"GUI foundation", MUTED);
-    framebuffer::draw_rect(
-        0,
-        screen_height.saturating_sub(STATUS_BAR_HEIGHT),
-        screen_width,
-        STATUS_BAR_HEIGHT,
-        PANEL,
-    );
-    framebuffer::draw_text(
-        24,
-        screen_height.saturating_sub(STATUS_BAR_HEIGHT) + 12,
-        &uptime_text[..uptime_length],
-        MUTED,
-    );
-    framebuffer::draw_text(
-        176,
-        screen_height.saturating_sub(STATUS_BAR_HEIGHT) + 12,
-        &windows_text[..windows_length],
-        MUTED,
-    );
-    framebuffer::draw_text(
-        360,
-        screen_height.saturating_sub(STATUS_BAR_HEIGHT) + 12,
-        focus_text,
-        ACCENT,
-    );
 
     let gui = state().lock();
     for slot in gui.z_order {
@@ -1293,30 +1546,113 @@ fn render_desktop_contents(excluded_window: Option<u32>, draw_cursor: bool) {
         draw_window_surface(source, &window, focused == Some(window.id));
     }
     drop(gui);
+    draw_top_bar(screen_width, &focused_title[..focused_title_length]);
+    draw_bottom_dock(screen_width, screen_height);
     if draw_cursor {
-        toggle_cursor(cursor);
+        toggle_cursor_locked(cursor);
     }
 }
 
-fn format_status(output: &mut [u8], prefix: &[u8], mut value: u64) -> usize {
-    let prefix_length = prefix.len().min(output.len());
-    output[..prefix_length].copy_from_slice(&prefix[..prefix_length]);
-    let mut digits = [0u8; 20];
-    let mut digit_count = 0;
+fn draw_top_bar(screen_width: usize, active_title: &[u8]) {
+    framebuffer::draw_rect(0, 0, screen_width, STATUS_BAR_HEIGHT, PANEL);
+    framebuffer::draw_rect(0, 0, screen_width, 1, ACCENT);
+    framebuffer::draw_text(12, 12, b"LeafOS", TEXT);
+    framebuffer::draw_text(80, 12, active_title, MUTED);
+
+    let mut clock = [0; 8];
+    format_clock(&mut clock, crate::timer::ticks());
+    framebuffer::draw_text(screen_width.saturating_sub(136), 12, &clock, TEXT);
+
+    for core in 0..3 {
+        let x = screen_width.saturating_sub(44) + core * 12;
+        framebuffer::draw_rect(x, 6, 8, 14, CARD);
+        let idle = crate::scheduler::cpu_is_idle(core).unwrap_or(true);
+        let load_height = if idle { 4 } else { 12 };
+        framebuffer::draw_rect(
+            x + 1,
+            19 - load_height,
+            6,
+            load_height,
+            if idle { MUTED } else { ACCENT },
+        );
+        framebuffer::draw_text(x, 22, &[b'0' + core as u8], MUTED);
+    }
+}
+
+fn format_clock(output: &mut [u8; 8], ticks: u64) {
+    let total_seconds = ticks / crate::timer::TICKS_PER_SECOND;
+    let hours = (total_seconds / 3_600) % 24;
+    let minutes = (total_seconds / 60) % 60;
+    let seconds = total_seconds % 60;
+    output[0] = b'0' + (hours / 10) as u8;
+    output[1] = b'0' + (hours % 10) as u8;
+    output[2] = b':';
+    output[3] = b'0' + (minutes / 10) as u8;
+    output[4] = b'0' + (minutes % 10) as u8;
+    output[5] = b':';
+    output[6] = b'0' + (seconds / 10) as u8;
+    output[7] = b'0' + (seconds % 10) as u8;
+}
+
+fn draw_bottom_dock(screen_width: usize, screen_height: usize) {
+    let dock = bottom_dock_bounds(screen_width, screen_height);
+    framebuffer::draw_rect(dock.0, dock.1, dock.2, dock.3, DOCK);
+    for (index, label) in [
+        b"[ TERM ]".as_slice(),
+        b"[ EDIT ]".as_slice(),
+        b"[ INFO ]".as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let button = dock_button_bounds(index, dock);
+        framebuffer::draw_rect(button.0, button.1, button.2, button.3, DOCK_BUTTON);
+        let text_width = label.len().saturating_mul(TERMINAL_CELL_WIDTH);
+        let text_x = button.0 + button.2.saturating_sub(text_width) / 2;
+        let text_y = button.1 + button.3.saturating_sub(8) / 2;
+        framebuffer::draw_text(text_x, text_y, label, TEXT);
+    }
+}
+
+pub fn refresh_top_bar_if_due() {
+    if !framebuffer::is_initialized() {
+        return;
+    }
+    let second = crate::timer::uptime_seconds();
+    let mut previous = LAST_TOP_BAR_SECOND.load(Ordering::Acquire);
     loop {
-        digits[digit_count] = b'0' + (value % 10) as u8;
-        digit_count += 1;
-        value /= 10;
-        if value == 0 {
-            break;
+        if previous == second {
+            return;
+        }
+        match LAST_TOP_BAR_SECOND.compare_exchange_weak(
+            previous,
+            second,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(actual) => previous = actual,
         }
     }
-    let available = output.len().saturating_sub(prefix_length);
-    let count = digit_count.min(available);
-    for index in 0..count {
-        output[prefix_length + index] = digits[digit_count - 1 - index];
+
+    if !is_active() {
+        return;
     }
-    prefix_length + count
+
+    let _canvas = CANVAS_LOCK.lock();
+    let (active, cursor, title) = {
+        let gui = state().lock();
+        (gui.active, gui.cursor, focused_title(&gui))
+    };
+    if !active {
+        return;
+    }
+    let (screen_width, _) = framebuffer::dimensions().unwrap_or((1280, 800));
+    toggle_cursor_locked(cursor);
+    framebuffer::begin_frame();
+    draw_top_bar(screen_width, &title.0[..title.1]);
+    framebuffer::end_frame();
+    toggle_cursor_locked(cursor);
 }
 
 fn draw_terminal_contents(window: &Window) {
@@ -1330,7 +1666,7 @@ fn draw_terminal_rows_contents(window: &Window, dirty_rows: Option<(usize, usize
     let body_width = window.width.saturating_sub(16);
     let body_height = window.height.saturating_sub(54);
 
-    let rows = (body_height / 8).min(TERMINAL_ROWS);
+    let rows = (body_height / TERMINAL_LINE_STRIDE).min(TERMINAL_ROWS);
     let columns = (body_width / TERMINAL_CELL_WIDTH).min(TERMINAL_COLUMNS);
     let first_visible = window
         .terminal_buffer
@@ -1350,9 +1686,9 @@ fn draw_terminal_rows_contents(window: &Window, dirty_rows: Option<(usize, usize
         let length = line.length.min(columns);
         framebuffer::draw_rect(
             body_x,
-            body_y + (row - first_visible) * 8,
+            body_y + (row - first_visible) * TERMINAL_LINE_STRIDE,
             body_width,
-            8,
+            TERMINAL_LINE_STRIDE,
             TERMINAL_BACKGROUND,
         );
         if length != 0 {
@@ -1363,7 +1699,7 @@ fn draw_terminal_rows_contents(window: &Window, dirty_rows: Option<(usize, usize
             );
             framebuffer::draw_text(
                 body_x,
-                body_y + (row - first_visible) * 8,
+                body_y + (row - first_visible) * TERMINAL_LINE_STRIDE,
                 &line.bytes[..length],
                 color,
             );
@@ -1379,7 +1715,7 @@ fn draw_terminal_rows_contents(window: &Window, dirty_rows: Option<(usize, usize
         {
             framebuffer::draw_rect(
                 body_x + cursor_column * TERMINAL_CELL_WIDTH,
-                body_y + (cursor_buffer_row - first_visible) * 8 + 6,
+                body_y + (cursor_buffer_row - first_visible) * TERMINAL_LINE_STRIDE + 6,
                 6,
                 2,
                 window.terminal_buffer.foreground,
@@ -1389,6 +1725,24 @@ fn draw_terminal_rows_contents(window: &Window, dirty_rows: Option<(usize, usize
 }
 
 fn render_terminal_rows(owner: u64, rows: Option<(usize, usize)>) {
+    if !framebuffer::is_initialized() {
+        return;
+    }
+    let _canvas = CANVAS_LOCK.lock();
+    let (active, cursor) = {
+        let gui = state().lock();
+        (gui.active, gui.cursor)
+    };
+    if active {
+        toggle_cursor_locked(cursor);
+    }
+    render_terminal_rows_locked(owner, rows);
+    if active {
+        toggle_cursor_locked(cursor);
+    }
+}
+
+fn render_terminal_rows_locked(owner: u64, rows: Option<(usize, usize)>) {
     if !framebuffer::is_initialized() {
         return;
     }
@@ -1459,7 +1813,7 @@ fn draw_window_surface(source: &Window, window: &WindowSnapshot, focused: bool) 
     }
 }
 
-fn render_drag_damage(
+fn render_drag_damage_locked(
     old_geometry: (usize, usize, usize, usize),
     new_geometry: (usize, usize, usize, usize),
     dragged_window_id: Option<u32>,
@@ -1524,16 +1878,6 @@ fn render_drag_damage(
         damage.3.saturating_sub(damage.1),
         DESKTOP,
     );
-    if damage.1 < 42 {
-        framebuffer::draw_rect(
-            damage.0,
-            damage.1,
-            damage.2.saturating_sub(damage.0),
-            damage.3.min(42).saturating_sub(damage.1),
-            PANEL,
-        );
-    }
-
     for slot in gui.z_order {
         let source = &gui.windows[slot];
         if !source.visible || Some(source.id) == dragged_window_id {
@@ -1578,9 +1922,18 @@ fn render_drag_damage(
         };
         draw_window_surface(window, &snapshot, gui.focused == Some(window.id));
     }
+    let (screen_width, screen_height) = framebuffer::dimensions().unwrap_or((1280, 800));
+    let (title, title_length) = focused_title(&gui);
+    draw_top_bar(screen_width, &title[..title_length]);
+    draw_bottom_dock(screen_width, screen_height);
 }
 
 fn toggle_cursor((x, y): (i32, i32)) {
+    let _canvas = CANVAS_LOCK.lock();
+    toggle_cursor_locked((x, y));
+}
+
+fn toggle_cursor_locked((x, y): (i32, i32)) {
     if x < 0 || y < 0 {
         return;
     }
@@ -1613,6 +1966,73 @@ mod tests {
         state.push_event(8, GuiEvent::Key(b'b'));
         assert_eq!(state.pop_event(8), Some(GuiEvent::Key(b'b')));
         assert_eq!(state.pop_event(7), Some(GuiEvent::Key(b'a')));
+    }
+
+    #[test_case]
+    fn terminal_keys_are_isolated_and_only_read_while_focused() {
+        let mut state = GuiState::new();
+        state.active = true;
+        for (slot, id, owner) in [(0, 10, 7), (1, 11, 8)] {
+            let mut window = Window::empty();
+            window.id = id;
+            window.owner = owner;
+            window.visible = true;
+            window.terminal = true;
+            state.windows[slot] = window;
+        }
+
+        state.focused = Some(10);
+        assert!(state.push_focused_key(b'a'));
+        state.focused = Some(11);
+        assert!(state.push_focused_key(b'b'));
+        assert_eq!(state.pop_focused_terminal_key(7), None);
+        assert_eq!(state.pop_focused_terminal_key(8), Some(b'b'));
+        state.focused = Some(10);
+        assert_eq!(state.pop_focused_terminal_key(7), Some(b'a'));
+        assert_eq!(state.pop_focused_terminal_key(7), None);
+        state.focused = None;
+        assert!(state.push_focused_key(b'c'));
+        state.focused = Some(10);
+        assert_eq!(state.pop_focused_terminal_key(7), None);
+    }
+
+    #[test_case]
+    fn dock_shortcut_hitboxes_match_the_centered_dock() {
+        let dock = bottom_dock_bounds(1920, 1080);
+        assert_eq!(dock, (760, 1016, 400, 48));
+        let actions = [DockAction::Terminal, DockAction::Edit, DockAction::Info];
+        for (index, action) in actions.into_iter().enumerate() {
+            let button = dock_button_bounds(index, dock);
+            assert_eq!(
+                dock_action_at(
+                    (button.0 + button.2 / 2) as i32,
+                    (button.1 + button.3 / 2) as i32,
+                    1920,
+                    1080,
+                ),
+                Some(action)
+            );
+        }
+        assert_eq!(dock_action_at(0, 0, 1920, 1080), None);
+    }
+
+    #[test_case]
+    fn live_clock_formats_ticks_as_twenty_four_hour_time() {
+        let mut clock = [0; 8];
+        format_clock(&mut clock, 12_345);
+        assert_eq!(&clock, b"00:02:03");
+        format_clock(&mut clock, 24 * 60 * 60 * crate::timer::TICKS_PER_SECOND);
+        assert_eq!(&clock, b"00:00:00");
+    }
+
+    #[test_case]
+    fn terminal_key_buffer_queues_shortcuts_atomically() {
+        let mut buffer = TerminalKeyBuffer::new();
+        assert!(buffer.push_bytes(b"info\n"));
+        assert_eq!(buffer.length, 5);
+        assert!(buffer.push_bytes(&[b'x'; KEY_BUFFER_CAPACITY - 5]));
+        assert!(!buffer.push_bytes(b"edit "));
+        assert_eq!(buffer.length, KEY_BUFFER_CAPACITY);
     }
 
     #[test_case]

@@ -1,6 +1,7 @@
+use super::acpi;
 use crate::memory;
 use crate::sync::{Mutex, Once};
-use super::acpi;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use x86::msr::{IA32_APIC_BASE, rdmsr, wrmsr};
 
 const APIC_ENABLE: u64 = 1 << 11;
@@ -21,6 +22,8 @@ const ICR_INIT: u32 = 5 << 8;
 const ICR_STARTUP: u32 = 6 << 8;
 const ICR_LEVEL_DEASSERT: u32 = 0;
 const ICR_FIXED: u32 = 0;
+const ICR_NMI: u32 = 4 << 8;
+const ICR_DESTINATION_ALL_EXCLUDING_SELF: u32 = 3 << 18;
 const IPI_TIMEOUT: usize = 1_000_000;
 pub const RESCHEDULE_VECTOR: u8 = 0xf0;
 
@@ -107,17 +110,14 @@ impl Apic {
 
     unsafe fn send_ipi(&mut self, apic_id: u32, command: u32) -> bool {
         for _ in 0..IPI_TIMEOUT {
-            if unsafe { self.local.add(LOCAL_APIC_ICR_LOW).read_volatile() }
-                & ICR_DELIVERY_STATUS
+            if unsafe { self.local.add(LOCAL_APIC_ICR_LOW).read_volatile() } & ICR_DELIVERY_STATUS
                 == 0
             {
                 break;
             }
             core::hint::spin_loop();
         }
-        if unsafe { self.local.add(LOCAL_APIC_ICR_LOW).read_volatile() }
-            & ICR_DELIVERY_STATUS
-            != 0
+        if unsafe { self.local.add(LOCAL_APIC_ICR_LOW).read_volatile() } & ICR_DELIVERY_STATUS != 0
         {
             return false;
         }
@@ -126,8 +126,7 @@ impl Apic {
             self.local_write(LOCAL_APIC_ICR_LOW, command);
         }
         for _ in 0..IPI_TIMEOUT {
-            if unsafe { self.local.add(LOCAL_APIC_ICR_LOW).read_volatile() }
-                & ICR_DELIVERY_STATUS
+            if unsafe { self.local.add(LOCAL_APIC_ICR_LOW).read_volatile() } & ICR_DELIVERY_STATUS
                 == 0
             {
                 return true;
@@ -139,6 +138,7 @@ impl Apic {
 }
 
 static APIC: Once<Option<Mutex<Apic>>> = Once::new();
+static LOCAL_APIC_BASE: AtomicUsize = AtomicUsize::new(0);
 
 pub fn initialize() -> bool {
     if !x86::cpuid::CpuId::new()
@@ -148,10 +148,13 @@ pub fn initialize() -> bool {
         return false;
     }
     APIC.call_once(|| {
-        acpi::info().and_then(|info| Apic::new(info).map(|mut apic| {
-            unsafe { apic.initialize() };
-            Mutex::new(apic)
-        }))
+        acpi::info().and_then(|info| {
+            Apic::new(info).map(|mut apic| {
+                LOCAL_APIC_BASE.store(apic.local as usize, Ordering::Release);
+                unsafe { apic.initialize() };
+                Mutex::new(apic)
+            })
+        })
     });
     APIC.get().is_some_and(Option::is_some)
 }
@@ -183,23 +186,46 @@ pub fn send_reschedule_ipi(apic_id: u32) -> bool {
     send_ipi(apic_id, ICR_FIXED | u32::from(RESCHEDULE_VECTOR))
 }
 
+pub fn panic_stop_other_cpus() -> bool {
+    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return false;
+    }
+
+    let local = base as *mut u32;
+    for _ in 0..IPI_TIMEOUT {
+        if unsafe { local.add(LOCAL_APIC_ICR_LOW).read_volatile() } & ICR_DELIVERY_STATUS == 0 {
+            unsafe {
+                local
+                    .add(LOCAL_APIC_ICR_LOW)
+                    .write_volatile(ICR_DESTINATION_ALL_EXCLUDING_SELF | ICR_NMI);
+            }
+            for _ in 0..IPI_TIMEOUT {
+                if unsafe { local.add(LOCAL_APIC_ICR_LOW).read_volatile() } & ICR_DELIVERY_STATUS
+                    == 0
+                {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
 pub fn current_apic_id() -> Option<u32> {
     let apic = APIC.get()?.as_ref()?;
     Some(unsafe { apic.lock().local.add(LOCAL_APIC_ID).read_volatile() >> 24 })
 }
 
 pub fn send_init_ipi(apic_id: u32) -> bool {
-    if !send_ipi(
-        apic_id,
-        ICR_INIT | ICR_ASSERT | ICR_TRIGGER_LEVEL,
-    ) {
+    if !send_ipi(apic_id, ICR_INIT | ICR_ASSERT | ICR_TRIGGER_LEVEL) {
         return false;
     }
     crate::timer::sleep_ticks(1);
-    send_ipi(
-        apic_id,
-        ICR_INIT | ICR_LEVEL_DEASSERT | ICR_TRIGGER_LEVEL,
-    )
+    send_ipi(apic_id, ICR_INIT | ICR_LEVEL_DEASSERT | ICR_TRIGGER_LEVEL)
 }
 
 pub fn send_startup_ipi(apic_id: u32, vector: u8) -> bool {

@@ -50,6 +50,8 @@ pub fn test_runner(tests: &[&dyn Testable]) {
     for test in tests {
         test.run();
     }
+    #[cfg(test)]
+    tasking::scheduler::run_smp_work_stealing_test();
     exit_qemu(QemuExitCode::Success);
 }
 
@@ -67,6 +69,7 @@ pub extern "C" fn _start(boot_info: *const boot_info::BootInfo) -> ! {
     let boot_info = unsafe { boot_info::BootInfo::from_ptr(boot_info) }
         .expect("test boot requires valid BootInfo");
     unsafe { memory::initialize(boot_info) }.expect("initialize physical memory manager");
+    drivers::acpi::initialize(boot_info.acpi_rsdp, boot_info.physical_memory_offset);
     unsafe { memory::heap::initialize() }.expect("initialize kernel heap");
     init();
     test_main();

@@ -307,6 +307,10 @@ pub fn initialize() -> Result<(), Ext2Error> {
         .map_err(|error| *error)
 }
 
+pub fn is_initialized() -> bool {
+    EXT2.get().is_some_and(|metadata| metadata.is_ok())
+}
+
 fn metadata() -> Result<Metadata, Ext2Error> {
     EXT2.get()
         .ok_or(Ext2Error::NotInitialized)?

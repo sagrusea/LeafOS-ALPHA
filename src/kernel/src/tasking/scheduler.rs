@@ -1,14 +1,19 @@
 use crate::arch::user::{UserContext, UserContextError};
 use crate::memory::{self, AddressSpace};
+#[cfg(test)]
+use crate::serial_println;
 use crate::sync::Mutex;
 use crate::tasking::fd::{self, FileDescriptor, MAX_FDS};
 use alloc::boxed::Box;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::VirtAddr;
 
-pub const MAX_TASKS: usize = 16;
+pub const PER_CORE_MAX_TASKS: usize = 8;
+pub const MAX_TASKS: usize = PER_CORE_MAX_TASKS * crate::arch::syscall::MAX_CPUS;
 const KERNEL_STACK_SIZE: usize = 64 * 1024;
+const STACK_ALIGNMENT: usize = 16;
 
 pub type KernelTaskEntry = fn();
 
@@ -51,6 +56,56 @@ pub struct TaskInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CpuSchedulerStats {
+    pub context_switches: u64,
+    pub timer_preemptions: u64,
+    pub idle_ticks: u64,
+    pub tasks_executed: u64,
+    pub runnable_tasks: usize,
+    pub steal_attempts: u64,
+    pub successful_steals: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SchedulerStats {
+    pub cpus: [Option<CpuSchedulerStats>; crate::arch::syscall::MAX_CPUS],
+    pub work_stealing_events: u64,
+}
+
+struct CpuCounters {
+    context_switches: AtomicU64,
+    timer_preemptions: AtomicU64,
+    idle_ticks: AtomicU64,
+    tasks_executed: AtomicU64,
+    steal_attempts: AtomicU64,
+    successful_steals: AtomicU64,
+}
+
+impl CpuCounters {
+    const fn new() -> Self {
+        Self {
+            context_switches: AtomicU64::new(0),
+            timer_preemptions: AtomicU64::new(0),
+            idle_ticks: AtomicU64::new(0),
+            tasks_executed: AtomicU64::new(0),
+            steal_attempts: AtomicU64::new(0),
+            successful_steals: AtomicU64::new(0),
+        }
+    }
+}
+
+static SCHEDULER_STATS: [CpuCounters; crate::arch::syscall::MAX_CPUS] =
+    [const { CpuCounters::new() }; crate::arch::syscall::MAX_CPUS];
+static TOTAL_SUCCESSFUL_STEALS: AtomicU64 = AtomicU64::new(0);
+static STEAL_VICTIM_CURSOR: [AtomicU64; crate::arch::syscall::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::arch::syscall::MAX_CPUS];
+static LAST_STEAL_TICK: [AtomicU64; crate::arch::syscall::MAX_CPUS] =
+    [const { AtomicU64::new(u64::MAX) }; crate::arch::syscall::MAX_CPUS];
+// Prevent task-ID lookups from observing a gap while ownership moves between queues.
+static TASK_MIGRATION_LOCK: Mutex<()> = Mutex::new(());
+const STEAL_RETRY_TICKS: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct CpuContext {
     pub stack_pointer: u64,
@@ -78,6 +133,17 @@ impl CpuContext {
     }
 }
 
+const _: () = {
+    assert!(core::mem::offset_of!(CpuContext, stack_pointer) == 0);
+    assert!(core::mem::offset_of!(CpuContext, rbx) == 8);
+    assert!(core::mem::offset_of!(CpuContext, rbp) == 16);
+    assert!(core::mem::offset_of!(CpuContext, r12) == 24);
+    assert!(core::mem::offset_of!(CpuContext, r13) == 32);
+    assert!(core::mem::offset_of!(CpuContext, r14) == 40);
+    assert!(core::mem::offset_of!(CpuContext, r15) == 48);
+    assert!(core::mem::offset_of!(CpuContext, rflags) == 56);
+};
+
 struct Task {
     id: TaskId,
     parent: Option<TaskId>,
@@ -86,11 +152,18 @@ struct Task {
     context: CpuContext,
     entry: Option<KernelTaskEntry>,
     user: Option<UserTask>,
-    _stack: Option<Box<[u64]>>,
+    _stack: Option<Box<[u128]>>,
     stack_top: Option<VirtAddr>,
     wake_at: Option<u64>,
     is_idle: bool,
     kill_pending: bool,
+    wake_pending: bool,
+    waiting_for_child: bool,
+    auto_reap: bool,
+    switch_pending_cpu: Option<usize>,
+    cleanup_pending: bool,
+    reaping: bool,
+    // `None` is unpinned; `Some(cpu)` is an explicit CPU-affinity constraint.
     cpu_affinity: Option<usize>,
     fds: [Option<FileDescriptor>; MAX_FDS],
 }
@@ -122,47 +195,86 @@ fn find_free_fd<T>(fds: &[Option<T>; MAX_FDS]) -> Option<usize> {
     fds.iter().position(Option::is_none)
 }
 
-pub struct Scheduler {
-    tasks: [Option<Task>; MAX_TASKS],
+fn apply_fd_mappings(
+    fds: &mut [Option<FileDescriptor>; MAX_FDS],
+    mappings: &[FdMapping],
+    closes: &[usize],
+) -> Result<(), SchedulerError> {
+    for mapping in mappings {
+        if mapping.source >= MAX_FDS || mapping.target >= MAX_FDS || fds[mapping.source].is_none() {
+            return Err(SchedulerError::InvalidFd);
+        }
+    }
+    if closes.iter().any(|&fd_number| fd_number >= MAX_FDS) {
+        return Err(SchedulerError::InvalidFd);
+    }
+
+    let mut source_snapshot: [Option<FileDescriptor>; MAX_FDS] = core::array::from_fn(|_| None);
+    for mapping in mappings {
+        if source_snapshot[mapping.source].is_none() {
+            source_snapshot[mapping.source] = fds[mapping.source].as_ref().cloned();
+        }
+    }
+
+    for mapping in mappings {
+        let descriptor = source_snapshot[mapping.source]
+            .as_ref()
+            .ok_or(SchedulerError::InvalidFd)?
+            .clone();
+        if let Some(previous) = fds[mapping.target].replace(descriptor) {
+            fd::close(previous);
+        }
+    }
+
+    for mapping in mappings {
+        let source_is_destination = mappings
+            .iter()
+            .any(|candidate| candidate.target == mapping.source);
+        if mapping.source != mapping.target
+            && !source_is_destination
+            && let Some(descriptor) = fds[mapping.source].take()
+        {
+            fd::close(descriptor);
+        }
+    }
+
+    for &fd_number in closes {
+        if let Some(descriptor) = fds[fd_number].take() {
+            fd::close(descriptor);
+        }
+    }
+    Ok(())
+}
+
+pub struct RunQueue {
+    tasks: [Option<Task>; PER_CORE_MAX_TASKS],
     current: Option<usize>,
-    secondary_current: [Option<usize>; crate::arch::syscall::MAX_CPUS],
     next_id: u64,
     idle_index: Option<usize>,
 }
 
-impl Scheduler {
+type Scheduler = RunQueue;
+
+impl RunQueue {
     pub const fn new() -> Self {
         Self {
-            tasks: [const { None }; MAX_TASKS],
+            tasks: [const { None }; PER_CORE_MAX_TASKS],
             current: None,
-            secondary_current: [None; crate::arch::syscall::MAX_CPUS],
             next_id: 1,
             idle_index: None,
         }
     }
 
-    fn current_index(&self, cpu_index: usize) -> Option<usize> {
-        if cpu_index == 0 {
-            self.current
-        } else {
-            self.secondary_current.get(cpu_index).copied().flatten()
-        }
+    fn current_index(&self, _cpu_index: usize) -> Option<usize> {
+        self.current
     }
 
-    fn set_current_index(&mut self, cpu_index: usize, task_index: Option<usize>) {
-        if cpu_index == 0 {
-            self.current = task_index;
-        } else if let Some(current) = self.secondary_current.get_mut(cpu_index) {
-            *current = task_index;
-        }
+    fn set_current_index(&mut self, _cpu_index: usize, task_index: Option<usize>) {
+        self.current = task_index;
     }
 
     fn task_is_running(&self, task_index: usize) -> bool {
         self.current == Some(task_index)
-            || self
-                .secondary_current
-                .iter()
-                .any(|&current| current == Some(task_index))
     }
 
     pub fn create_task(&mut self, context: CpuContext) -> Result<TaskId, SchedulerError> {
@@ -174,22 +286,26 @@ impl Scheduler {
         entry: KernelTaskEntry,
         parent: Option<TaskId>,
     ) -> Result<TaskId, SchedulerError> {
-        // Fail before allocating the kernel stack. In particular, a full task
-        // table must return `Full` even when the allocator is exhausted.
         self.check_task_capacity()?;
-        self.next_id
+        let next_id = self
+            .next_id
             .checked_add(1)
             .ok_or(SchedulerError::TaskIdExhausted)?;
-
+        let id = allocate_task_id()?;
         let (context, stack, stack_top) = create_task_stack()?;
-        self.insert_task(
+        let task = self.insert_task_with_id(
+            id,
             context,
             parent,
             Some(entry),
             None,
             Some(stack),
             Some(stack_top),
-        )
+        );
+        if task.is_ok() {
+            self.next_id = next_id;
+        }
+        task
     }
 
     fn create_user_task(
@@ -197,58 +313,23 @@ impl Scheduler {
         address_space: &mut Option<AddressSpace>,
         context: UserContext,
         parent: Option<TaskId>,
+        parent_fds: Option<[Option<FileDescriptor>; MAX_FDS]>,
         fd_mappings: &[FdMapping],
         fd_closes: &[usize],
     ) -> Result<TaskId, SchedulerError> {
-        self.check_task_capacity()?;
+        self.check_spawn_capacity()?;
         let next_id = self
             .next_id
             .checked_add(1)
             .ok_or(SchedulerError::TaskIdExhausted)?;
+        let mut fds = parent_fds.unwrap_or_else(fd::initial_table);
+        apply_fd_mappings(&mut fds, fd_mappings, fd_closes)?;
+        let id = allocate_task_id()?;
         let (cpu_context, stack, stack_top) = create_task_stack()?;
         let address_space = address_space.take().ok_or(SchedulerError::InvalidContext)?;
-        let fds = parent
-            .and_then(|parent| {
-                self.tasks
-                    .iter()
-                    .flatten()
-                    .find(|task| task.id == parent)
-                    .map(|task| task.fds.clone())
-            })
-            .unwrap_or_else(fd::initial_table);
-        let mut fds = fds;
-        for mapping in fd_mappings {
-            if mapping.source >= MAX_FDS || mapping.target >= MAX_FDS {
-                return Err(SchedulerError::InvalidFd);
-            }
-            let descriptor = fds[mapping.source]
-                .as_ref()
-                .cloned()
-                .ok_or(SchedulerError::InvalidFd)?;
-            if let Some(previous) = fds[mapping.target].take() {
-                fd::close(previous);
-            }
-            fds[mapping.target] = Some(descriptor);
-        }
-        for mapping in fd_mappings {
-            if mapping.source != mapping.target
-                && let Some(descriptor) = fds[mapping.source].take()
-            {
-                fd::close(descriptor);
-            }
-        }
-        for fd_number in fd_closes {
-            if *fd_number >= MAX_FDS {
-                return Err(SchedulerError::InvalidFd);
-            }
-            if let Some(descriptor) = fds[*fd_number].take() {
-                fd::close(descriptor);
-            }
-        }
         let slot = self
-            .check_task_capacity()
+            .check_spawn_capacity()
             .expect("reserved user task slot remains available");
-        let id = TaskId(self.next_id);
         self.next_id = next_id;
         self.tasks[slot] = Some(Task {
             id,
@@ -267,6 +348,12 @@ impl Scheduler {
             wake_at: None,
             is_idle: false,
             kill_pending: false,
+            wake_pending: false,
+            waiting_for_child: false,
+            auto_reap: false,
+            switch_pending_cpu: None,
+            cleanup_pending: false,
+            reaping: false,
             cpu_affinity: None,
             fds,
         });
@@ -280,13 +367,21 @@ impl Scheduler {
             .ok_or(SchedulerError::Full)
     }
 
+    fn check_spawn_capacity(&self) -> Result<usize, SchedulerError> {
+        let free = self.tasks.iter().filter(|task| task.is_none()).count();
+        if self.idle_index.is_none() && free <= 1 {
+            return Err(SchedulerError::Full);
+        }
+        self.check_task_capacity()
+    }
+
     fn insert_task(
         &mut self,
         context: CpuContext,
         parent: Option<TaskId>,
         entry: Option<KernelTaskEntry>,
         user: Option<UserTask>,
-        stack: Option<Box<[u64]>>,
+        stack: Option<Box<[u128]>>,
         stack_top: Option<VirtAddr>,
     ) -> Result<TaskId, SchedulerError> {
         let slot = self.check_task_capacity()?;
@@ -295,6 +390,36 @@ impl Scheduler {
             .next_id
             .checked_add(1)
             .ok_or(SchedulerError::TaskIdExhausted)?;
+        self.insert_task_at(slot, id, context, parent, entry, user, stack, stack_top);
+        Ok(id)
+    }
+
+    fn insert_task_with_id(
+        &mut self,
+        id: TaskId,
+        context: CpuContext,
+        parent: Option<TaskId>,
+        entry: Option<KernelTaskEntry>,
+        user: Option<UserTask>,
+        stack: Option<Box<[u128]>>,
+        stack_top: Option<VirtAddr>,
+    ) -> Result<TaskId, SchedulerError> {
+        let slot = self.check_task_capacity()?;
+        self.insert_task_at(slot, id, context, parent, entry, user, stack, stack_top);
+        Ok(id)
+    }
+
+    fn insert_task_at(
+        &mut self,
+        slot: usize,
+        id: TaskId,
+        context: CpuContext,
+        parent: Option<TaskId>,
+        entry: Option<KernelTaskEntry>,
+        user: Option<UserTask>,
+        stack: Option<Box<[u128]>>,
+        stack_top: Option<VirtAddr>,
+    ) {
         self.tasks[slot] = Some(Task {
             id,
             parent,
@@ -308,14 +433,19 @@ impl Scheduler {
             wake_at: None,
             is_idle: false,
             kill_pending: false,
+            wake_pending: false,
+            waiting_for_child: false,
+            auto_reap: false,
+            switch_pending_cpu: None,
+            cleanup_pending: false,
+            reaping: false,
             cpu_affinity: None,
             fds: fd::initial_table(),
         });
-        Ok(id)
     }
 
     pub fn start(&mut self) -> Result<TaskId, SchedulerError> {
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let cpu_index = current_runqueue_index();
         if self.current_index(cpu_index).is_some() {
             return Err(SchedulerError::AlreadyStarted);
         }
@@ -347,7 +477,7 @@ impl Scheduler {
     }
 
     fn transition_current(&mut self, next_state: TaskState) -> Result<TaskId, SchedulerError> {
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let cpu_index = current_runqueue_index();
         let current = self
             .current_index(cpu_index)
             .ok_or(SchedulerError::NotStarted)?;
@@ -359,15 +489,28 @@ impl Scheduler {
             return Err(SchedulerError::InvalidState);
         }
         task.state = next_state;
+        if next_state == TaskState::Blocked && task.wake_pending {
+            task.wake_pending = false;
+            task.state = TaskState::Ready;
+            task.waiting_for_child = false;
+        }
         if next_state != TaskState::Sleeping {
             task.wake_at = None;
         }
         self.set_current_index(cpu_index, None);
-        self.select_next((current + 1) % MAX_TASKS, cpu_index)
+        self.select_next((current + 1) % PER_CORE_MAX_TASKS, cpu_index)
+    }
+
+    fn mark_switch_pending(&mut self, index: usize, cpu_index: usize) {
+        if self.current_index(cpu_index) != Some(index) {
+            if let Some(task) = self.tasks[index].as_mut() {
+                task.switch_pending_cpu = Some(cpu_index);
+            }
+        }
     }
 
     fn sleep_current_until(&mut self, deadline: u64) -> Result<TaskId, SchedulerError> {
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let cpu_index = current_runqueue_index();
         let current = self
             .current_index(cpu_index)
             .ok_or(SchedulerError::NotStarted)?;
@@ -378,7 +521,7 @@ impl Scheduler {
         task.state = TaskState::Sleeping;
         task.wake_at = Some(deadline);
         self.set_current_index(cpu_index, None);
-        self.select_next((current + 1) % MAX_TASKS, cpu_index)
+        self.select_next((current + 1) % PER_CORE_MAX_TASKS, cpu_index)
     }
 
     fn wake_expired_sleepers(&mut self, now: u64) -> bool {
@@ -397,6 +540,7 @@ impl Scheduler {
         woke_any
     }
 
+    #[cfg(test)]
     fn has_live_non_idle_tasks(&self) -> bool {
         self.tasks
             .iter()
@@ -411,10 +555,14 @@ impl Scheduler {
             .flatten()
             .find(|task| task.id == id)
             .ok_or(SchedulerError::UnknownTask)?;
-        if task.state != TaskState::Blocked {
-            return Err(SchedulerError::InvalidState);
+        match task.state {
+            TaskState::Blocked => {
+                task.state = TaskState::Ready;
+                task.waiting_for_child = false;
+            }
+            TaskState::Running if task.waiting_for_child => task.wake_pending = true,
+            _ => return Err(SchedulerError::InvalidState),
         }
-        task.state = TaskState::Ready;
         Ok(())
     }
 
@@ -427,56 +575,175 @@ impl Scheduler {
         if self.task_is_running(index) {
             return Err(SchedulerError::InvalidState);
         }
+        let should_wake_parent = {
+            let task = self.tasks[index]
+                .as_mut()
+                .ok_or(SchedulerError::UnknownTask)?;
+            if task.is_idle || task.state == TaskState::Terminated {
+                return Err(SchedulerError::InvalidState);
+            }
+            task.exit_code = Some(exit_code);
+            task.state = TaskState::Terminated;
+            task.cleanup_pending = true;
+            task.switch_pending_cpu.is_none()
+        };
+        if should_wake_parent {
+            self.wake_parent(index);
+        }
+        Ok(())
+    }
+
+    fn request_terminate_task(
+        &mut self,
+        id: TaskId,
+        exit_code: u64,
+    ) -> Result<bool, SchedulerError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.as_ref().is_some_and(|task| task.id == id))
+            .ok_or(SchedulerError::UnknownTask)?;
+        let running = self.task_is_running(index);
+        let (on_cpu, wake_parent) = {
+            let task = self.tasks[index]
+                .as_mut()
+                .ok_or(SchedulerError::UnknownTask)?;
+            if task.is_idle {
+                return Err(SchedulerError::InvalidState);
+            }
+            task.auto_reap = true;
+            if task.state == TaskState::Terminated {
+                return Ok(false);
+            }
+            let switching_out = task.switch_pending_cpu.is_some();
+            task.exit_code = Some(exit_code);
+            task.cleanup_pending = true;
+            if running {
+                task.kill_pending = true;
+            } else {
+                task.state = TaskState::Terminated;
+            }
+            (running || switching_out, !running && !switching_out)
+        };
+        if wake_parent {
+            self.wake_parent(index);
+        }
+        Ok(on_cpu)
+    }
+
+    fn terminate_group_member(
+        &mut self,
+        id: TaskId,
+        exit_code: Option<u64>,
+    ) -> Result<(Option<TaskId>, bool), SchedulerError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.as_ref().is_some_and(|task| task.id == id))
+            .ok_or(SchedulerError::UnknownTask)?;
+        let running = self.task_is_running(index);
         let task = self.tasks[index]
             .as_mut()
             .ok_or(SchedulerError::UnknownTask)?;
-        if task.is_idle || task.state == TaskState::Terminated {
+        if task.is_idle {
             return Err(SchedulerError::InvalidState);
         }
-        task.exit_code = Some(exit_code);
-        task.state = TaskState::Terminated;
-        self.wake_parent(index);
-        Ok(())
+        if task.state == TaskState::Terminated {
+            return Ok((task.parent, false));
+        }
+        task.exit_code = exit_code;
+        task.cleanup_pending = true;
+        let parent = task.parent;
+        if running {
+            task.kill_pending = true;
+        } else {
+            task.state = TaskState::Terminated;
+            self.wake_parent(index);
+        }
+        Ok((parent, !running))
     }
 
     fn wake_all_blocked(&mut self) {
         for task in self.tasks.iter_mut().flatten() {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
+                task.waiting_for_child = false;
+                task.wake_pending = false;
             }
         }
     }
 
     pub fn save_current_context(&mut self, context: CpuContext) -> Result<(), SchedulerError> {
         let current = self
-            .current_index(crate::arch::syscall::current_cpu_index())
+            .current_index(current_runqueue_index())
             .ok_or(SchedulerError::NotStarted)?;
         self.task_mut(current)?.context = context;
         Ok(())
     }
 
-    pub fn reap_terminated(&mut self, id: TaskId) -> Result<(), SchedulerError> {
+    fn begin_reap(
+        &mut self,
+        id: TaskId,
+        reserved: bool,
+    ) -> Result<Option<UserTask>, SchedulerError> {
         let index = self
             .tasks
             .iter()
             .position(|task| task.as_ref().is_some_and(|task| task.id == id))
             .ok_or(SchedulerError::UnknownTask)?;
-        if self.task_is_running(index)
-            || self.tasks[index]
-                .as_ref()
-                .is_none_or(|task| task.state != TaskState::Terminated)
+        let is_running = self.task_is_running(index);
+        let task = self.tasks[index]
+            .as_mut()
+            .ok_or(SchedulerError::UnknownTask)?;
+        if is_running
+            || task.state != TaskState::Terminated
+            || task.switch_pending_cpu.is_some()
+            || task.reaping != reserved
         {
             return Err(SchedulerError::InvalidState);
         }
-        if let Some(user) = self.tasks[index]
-            .as_mut()
-            .and_then(|task| task.user.as_mut())
-        {
-            user.address_space
-                .destroy()
-                .map_err(|_| SchedulerError::AddressSpaceCleanup)?;
+        if !reserved {
+            task.reaping = true;
         }
-        self.tasks[index] = None;
+        Ok(task.user.take())
+    }
+
+    fn abort_reap(&mut self, id: TaskId, user: Option<UserTask>) {
+        if let Some(task) = self.tasks.iter_mut().flatten().find(|task| task.id == id) {
+            task.user = user;
+            task.reaping = false;
+        }
+    }
+
+    fn finish_reap(&mut self, id: TaskId) -> Result<Task, SchedulerError> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.as_ref().is_some_and(|task| task.id == id))
+            .ok_or(SchedulerError::UnknownTask)?;
+        let task = self.tasks[index]
+            .as_ref()
+            .ok_or(SchedulerError::UnknownTask)?;
+        if task.state != TaskState::Terminated
+            || task.switch_pending_cpu.is_some()
+            || !task.reaping
+            || self.task_is_running(index)
+        {
+            return Err(SchedulerError::InvalidState);
+        }
+        self.tasks[index].take().ok_or(SchedulerError::UnknownTask)
+    }
+
+    #[cfg(test)]
+    fn reap_terminated(&mut self, id: TaskId) -> Result<(), SchedulerError> {
+        let mut user = self.begin_reap(id, false)?;
+        if let Some(user_task) = user.as_mut() {
+            if user_task.address_space.destroy().is_err() {
+                self.abort_reap(id, user);
+                return Err(SchedulerError::AddressSpaceCleanup);
+            }
+        }
+        drop(self.finish_reap(id)?);
         Ok(())
     }
 
@@ -490,7 +757,7 @@ impl Scheduler {
         });
         let Some(task) = matching
             .clone()
-            .find(|task| task.state == TaskState::Terminated)
+            .find(|task| task.state == TaskState::Terminated && task.switch_pending_cpu.is_none())
         else {
             if matching.next().is_some() {
                 return Err(SchedulerError::ChildRunning);
@@ -517,12 +784,28 @@ impl Scheduler {
             && task.state == TaskState::Blocked
         {
             task.state = TaskState::Ready;
+            task.waiting_for_child = false;
+            task.wake_pending = false;
         }
     }
 
     pub fn current_task(&self) -> Option<TaskId> {
-        self.current_index(crate::arch::syscall::current_cpu_index())
+        self.current_index(current_runqueue_index())
             .and_then(|index| self.tasks[index].as_ref().map(|task| task.id))
+    }
+
+    fn set_waiting_for_child(&mut self, waiting: bool) -> Result<(), SchedulerError> {
+        let current = self
+            .current_index(current_runqueue_index())
+            .ok_or(SchedulerError::NotStarted)?;
+        let task = self.tasks[current]
+            .as_mut()
+            .ok_or(SchedulerError::UnknownTask)?;
+        task.waiting_for_child = waiting;
+        if !waiting {
+            task.wake_pending = false;
+        }
+        Ok(())
     }
 
     pub fn task_state(&self, id: TaskId) -> Result<TaskState, SchedulerError> {
@@ -533,8 +816,8 @@ impl Scheduler {
         self.task(id).map(|task| task.context)
     }
 
-    pub fn task_snapshot(&self) -> [Option<TaskInfo>; MAX_TASKS] {
-        let mut snapshot = [None; MAX_TASKS];
+    pub fn task_snapshot(&self) -> [Option<TaskInfo>; PER_CORE_MAX_TASKS] {
+        let mut snapshot = [None; PER_CORE_MAX_TASKS];
         for (entry, task) in snapshot.iter_mut().zip(self.tasks.iter()) {
             if let Some(task) = task {
                 *entry = Some(TaskInfo {
@@ -552,20 +835,20 @@ impl Scheduler {
 
     fn select_next(&mut self, start: usize, cpu_index: usize) -> Result<TaskId, SchedulerError> {
         // Prefer ordinary runnable tasks. The idle task is a permanent fallback.
+        // switch_pending_cpu prevents migration until the context is saved; user-task
+        // activation restores CPU-local syscall state and the destination address space.
         self.set_current_index(cpu_index, None);
         for pass in 0..2 {
-            for offset in 0..MAX_TASKS {
-                let index = (start + offset) % MAX_TASKS;
+            for offset in 0..PER_CORE_MAX_TASKS {
+                let index = (start + offset) % PER_CORE_MAX_TASKS;
                 if let Some(task) = self.tasks[index].as_mut()
                     && task.state == TaskState::Ready
                     && ((pass == 0 && !task.is_idle) || (pass == 1 && task.is_idle))
-                    && (cpu_index == 0 || !task.is_idle)
                     && task
                         .cpu_affinity
                         .is_none_or(|affinity| affinity == cpu_index)
                 {
                     task.state = TaskState::Running;
-                    task.cpu_affinity = Some(cpu_index);
                     let id = task.id;
                     self.set_current_index(cpu_index, Some(index));
                     return Ok(id);
@@ -590,10 +873,58 @@ impl Scheduler {
     }
 }
 
-impl Default for Scheduler {
+impl Default for RunQueue {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn migratable_task_index(source: &RunQueue, destination_cpu: usize) -> Option<usize> {
+    source.tasks.iter().enumerate().find_map(|(index, slot)| {
+        slot.as_ref()
+            .filter(|task| {
+                task.state == TaskState::Ready
+                    && !source.task_is_running(index)
+                    && !task.is_idle
+                    && !task.kill_pending
+                    && !task.cleanup_pending
+                    && !task.reaping
+                    && task.switch_pending_cpu.is_none()
+                    && task
+                        .cpu_affinity
+                        .is_none_or(|affinity| affinity == destination_cpu)
+            })
+            .map(|_| index)
+    })
+}
+
+fn migrate_ready_task(
+    source: &mut RunQueue,
+    destination: &mut RunQueue,
+    destination_cpu: usize,
+) -> Result<TaskId, SchedulerError> {
+    // The caller holds both queues in ascending CPU-index order. A user task's
+    // kernel stack is task-owned; destination selection reloads its CR3, GS
+    // syscall stack/user RSP, and TSS RSP0 before resuming the saved context.
+    // CR3 is used without PCID, so that load flushes the destination's
+    // non-global translations. Address-space mappings must not be changed
+    // concurrently with a running task; future shared mappings need shootdowns.
+    let source_index =
+        migratable_task_index(source, destination_cpu).ok_or(SchedulerError::NoRunnableTasks)?;
+    let destination_index = destination.check_task_capacity()?;
+    let id = source.tasks[source_index]
+        .as_ref()
+        .ok_or(SchedulerError::UnknownTask)?
+        .id;
+    if destination.task(id).is_ok() {
+        return Err(SchedulerError::InvalidState);
+    }
+
+    let task = source.tasks[source_index]
+        .take()
+        .ok_or(SchedulerError::UnknownTask)?;
+    destination.tasks[destination_index] = Some(task);
+    Ok(id)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -617,9 +948,230 @@ pub enum SchedulerError {
     NotChild,
 }
 
-static GLOBAL_SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
+static RUN_QUEUES: [Mutex<RunQueue>; crate::arch::syscall::MAX_CPUS] =
+    [const { Mutex::new(RunQueue::new()) }; crate::arch::syscall::MAX_CPUS];
+static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 static mut BOOTSTRAP_CONTEXTS: [CpuContext; crate::arch::syscall::MAX_CPUS] =
     [const { CpuContext::empty() }; crate::arch::syscall::MAX_CPUS];
+
+fn allocate_task_id() -> Result<TaskId, SchedulerError> {
+    NEXT_TASK_ID
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+        .map(TaskId)
+        .map_err(|_| SchedulerError::TaskIdExhausted)
+}
+
+fn current_runqueue_index() -> usize {
+    let cpu_index = crate::arch::syscall::current_cpu_index();
+    if cpu_index < crate::arch::syscall::MAX_CPUS {
+        cpu_index
+    } else {
+        0
+    }
+}
+
+fn online_runqueue(index: usize) -> bool {
+    index == 0 || crate::smp::cpu_is_online(index)
+}
+
+fn current_runqueue() -> &'static Mutex<RunQueue> {
+    &RUN_QUEUES[current_runqueue_index()]
+}
+
+#[cfg(test)]
+fn has_live_non_idle_tasks() -> bool {
+    RUN_QUEUES
+        .iter()
+        .any(|runqueue| runqueue.lock().has_live_non_idle_tasks())
+}
+
+fn find_task_queue(id: TaskId) -> Result<usize, SchedulerError> {
+    for (index, runqueue) in RUN_QUEUES.iter().enumerate() {
+        if runqueue.lock().task(id).is_ok() {
+            return Ok(index);
+        }
+    }
+    Err(SchedulerError::UnknownTask)
+}
+
+fn with_task_queue<T>(
+    id: TaskId,
+    operation: impl FnOnce(usize, &mut RunQueue) -> Result<T, SchedulerError>,
+) -> Result<T, SchedulerError> {
+    let _migration_guard = TASK_MIGRATION_LOCK.lock();
+    let index = find_task_queue(id)?;
+    let mut queue = RUN_QUEUES[index].lock();
+    if queue.task(id).is_err() {
+        return Err(SchedulerError::UnknownTask);
+    }
+    operation(index, &mut queue)
+}
+
+fn find_terminated_child(
+    parent: TaskId,
+    child: Option<TaskId>,
+) -> Result<(TaskId, Option<u64>), SchedulerError> {
+    let _migration_guard = TASK_MIGRATION_LOCK.lock();
+    let mut has_child = false;
+    for runqueue in RUN_QUEUES.iter() {
+        let queue = runqueue.lock();
+        match queue.terminated_child(parent, child) {
+            Ok(child_id) => {
+                let exit_code = queue.task(child_id)?.exit_code;
+                return Ok((child_id, exit_code));
+            }
+            Err(SchedulerError::ChildRunning) => has_child = true,
+            Err(SchedulerError::UnknownTask) | Err(SchedulerError::NoChild) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if has_child {
+        Err(SchedulerError::ChildRunning)
+    } else {
+        Err(if child.is_some() {
+            SchedulerError::UnknownTask
+        } else {
+            SchedulerError::NoChild
+        })
+    }
+}
+
+fn runnable_task_count(queue: &RunQueue, cpu_index: usize) -> usize {
+    queue
+        .tasks
+        .iter()
+        .flatten()
+        .filter(|task| {
+            !task.is_idle
+                && matches!(task.state, TaskState::Ready | TaskState::Running)
+                && task
+                    .cpu_affinity
+                    .is_none_or(|affinity| affinity == cpu_index)
+        })
+        .count()
+}
+
+fn select_runqueue() -> Result<usize, SchedulerError> {
+    RUN_QUEUES
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| online_runqueue(*index))
+        .filter_map(|(index, runqueue)| {
+            let queue = runqueue.lock();
+            let free = queue.tasks.iter().filter(|task| task.is_none()).count();
+            (free > usize::from(queue.idle_index.is_none()))
+                .then_some((index, runnable_task_count(&queue, index)))
+        })
+        .min_by_key(|(index, active)| (*active, *index))
+        .map(|(index, _)| index)
+        .ok_or(SchedulerError::Full)
+}
+
+fn steal_one_from(thief_cpu: usize, victim_cpu: usize) -> bool {
+    let _migration_guard = TASK_MIGRATION_LOCK.lock();
+    let result = if thief_cpu < victim_cpu {
+        let mut thief = RUN_QUEUES[thief_cpu].lock();
+        let mut victim = RUN_QUEUES[victim_cpu].lock();
+        if runnable_task_count(&thief, thief_cpu) != 0 {
+            return false;
+        }
+        migrate_ready_task(&mut victim, &mut thief, thief_cpu)
+    } else {
+        let mut victim = RUN_QUEUES[victim_cpu].lock();
+        let mut thief = RUN_QUEUES[thief_cpu].lock();
+        if runnable_task_count(&thief, thief_cpu) != 0 {
+            return false;
+        }
+        migrate_ready_task(&mut victim, &mut thief, thief_cpu)
+    };
+
+    if result.is_ok() {
+        SCHEDULER_STATS[thief_cpu]
+            .successful_steals
+            .fetch_add(1, Ordering::Relaxed);
+        TOTAL_SUCCESSFUL_STEALS.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+fn steal_retry_allowed(cpu_index: usize, now: u64, force: bool) -> bool {
+    let last_attempt = &LAST_STEAL_TICK[cpu_index];
+    let mut previous = last_attempt.load(Ordering::Relaxed);
+    loop {
+        if !force && previous != u64::MAX && now.wrapping_sub(previous) < STEAL_RETRY_TICKS {
+            return false;
+        }
+        match last_attempt.compare_exchange_weak(
+            previous,
+            now,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+fn attempt_work_steal(cpu_index: usize, force: bool) -> bool {
+    if cpu_index >= RUN_QUEUES.len() || !online_runqueue(cpu_index) {
+        return false;
+    }
+    let idle_and_empty = {
+        let queue = RUN_QUEUES[cpu_index].lock();
+        let is_idle = queue
+            .current_index(cpu_index)
+            .and_then(|current| queue.tasks[current].as_ref())
+            .is_some_and(|task| task.is_idle)
+            || (queue.current_index(cpu_index).is_none() && queue.idle_index.is_some());
+        is_idle && runnable_task_count(&queue, cpu_index) == 0
+    };
+    if !idle_and_empty || !steal_retry_allowed(cpu_index, crate::time::timer::ticks(), force) {
+        return false;
+    }
+
+    let cursor = STEAL_VICTIM_CURSOR[cpu_index].fetch_add(1, Ordering::Relaxed) as usize;
+    for offset in 0..RUN_QUEUES.len() {
+        let victim_cpu = (cursor.wrapping_add(offset)) % RUN_QUEUES.len();
+        if victim_cpu == cpu_index || !online_runqueue(victim_cpu) {
+            continue;
+        }
+        SCHEDULER_STATS[cpu_index]
+            .steal_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        if steal_one_from(cpu_index, victim_cpu) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_stealable_task_for(source_cpu: usize, destination_cpu: usize) -> bool {
+    let source = RUN_QUEUES[source_cpu].lock();
+    migratable_task_index(&source, destination_cpu).is_some()
+}
+
+fn notify_one_idle_cpu(source_cpu: usize) {
+    for destination_cpu in 1..RUN_QUEUES.len() {
+        if destination_cpu == source_cpu || !online_runqueue(destination_cpu) {
+            continue;
+        }
+        let idle = {
+            let queue = RUN_QUEUES[destination_cpu].lock();
+            queue
+                .current_index(destination_cpu)
+                .and_then(|index| queue.tasks[index].as_ref())
+                .is_some_and(|task| task.is_idle)
+                && runnable_task_count(&queue, destination_cpu) == 0
+        };
+        if idle && has_stealable_task_for(source_cpu, destination_cpu) {
+            crate::smp::wake_cpu(destination_cpu);
+            return;
+        }
+    }
+}
 
 fn bootstrap_context(cpu_index: usize) -> *mut CpuContext {
     let contexts = &raw mut BOOTSTRAP_CONTEXTS;
@@ -627,7 +1179,7 @@ fn bootstrap_context(cpu_index: usize) -> *mut CpuContext {
 }
 
 fn running_task_index(scheduler: &Scheduler) -> Option<usize> {
-    scheduler.current_index(crate::arch::syscall::current_cpu_index())
+    scheduler.current_index(current_runqueue_index())
 }
 
 struct InterruptGuard {
@@ -680,13 +1232,14 @@ unsafe extern "C" {
     fn leafos_context_switch(old: *mut CpuContext, new: *const CpuContext);
 }
 
-fn create_task_stack() -> Result<(CpuContext, Box<[u64]>, VirtAddr), SchedulerError> {
-    let mut stack = vec![0u64; KERNEL_STACK_SIZE / core::mem::size_of::<u64>()].into_boxed_slice();
-    let stack_base = stack.as_mut_ptr() as usize;
+fn create_task_stack() -> Result<(CpuContext, Box<[u128]>, VirtAddr), SchedulerError> {
+    let mut stack =
+        vec![0u128; KERNEL_STACK_SIZE / core::mem::size_of::<u128>()].into_boxed_slice();
+    let stack_base = stack.as_mut_ptr().cast::<u8>() as usize;
     let stack_top = stack_base
-        .checked_add(stack.len() * core::mem::size_of::<u64>())
+        .checked_add(stack.len() * core::mem::size_of::<u128>())
         .ok_or(SchedulerError::InvalidContext)?;
-    let aligned_top = stack_top & !0xf;
+    let aligned_top = stack_top & !(STACK_ALIGNMENT - 1);
     let initial_stack = aligned_top
         .checked_sub(2 * core::mem::size_of::<u64>())
         .ok_or(SchedulerError::InvalidContext)?;
@@ -694,9 +1247,28 @@ fn create_task_stack() -> Result<(CpuContext, Box<[u64]>, VirtAddr), SchedulerEr
         .checked_sub(stack_base)
         .filter(|offset| offset.is_multiple_of(core::mem::size_of::<u64>()))
         .map(|offset| offset / core::mem::size_of::<u64>())
-        .filter(|index| *index < stack.len())
+        .filter(|index| {
+            index
+                .checked_add(1)
+                .is_some_and(|end| end <= KERNEL_STACK_SIZE / core::mem::size_of::<u64>())
+        })
         .ok_or(SchedulerError::InvalidContext)?;
-    stack[stack_index] = task_trampoline as *const () as usize as u64;
+    unsafe {
+        (stack_base as *mut u8)
+            .cast::<u64>()
+            .add(stack_index)
+            .write(task_trampoline as *const () as usize as u64);
+    }
+
+    if stack_base % STACK_ALIGNMENT != 0
+        || initial_stack % STACK_ALIGNMENT != 0
+        || initial_stack < stack_base
+        || initial_stack
+            .checked_add(core::mem::size_of::<u64>())
+            .is_none_or(|end| end > stack_top)
+    {
+        return Err(SchedulerError::InvalidContext);
+    }
 
     let mut context = CpuContext::empty();
     context.stack_pointer = initial_stack as u64;
@@ -790,16 +1362,24 @@ pub fn spawn_user_with_arguments_and_fds(
         }
     };
 
-    let result = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        let parent = scheduler.current_task();
-        if scheduler.idle_index.is_none()
-            && scheduler.tasks.iter().filter(|slot| slot.is_none()).count() <= 1
-        {
-            Err(SchedulerError::Full)
-        } else {
-            scheduler.create_user_task(&mut address_space, context, parent, fd_mappings, fd_closes)
-        }
+    let (parent, parent_fds) = {
+        let queue = current_runqueue().lock();
+        let current = queue.current_index(current_runqueue_index());
+        current
+            .and_then(|index| queue.tasks[index].as_ref())
+            .map(|task| (Some(task.id), Some(task.fds.clone())))
+            .unwrap_or((None, None))
+    };
+    let result = match select_runqueue() {
+        Ok(index) => RUN_QUEUES[index].lock().create_user_task(
+            &mut address_space,
+            context,
+            parent,
+            parent_fds,
+            fd_mappings,
+            fd_closes,
+        ),
+        Err(error) => Err(error),
     };
     if result.is_err() {
         destroy_unspawned_address_space(&mut address_space)?;
@@ -810,28 +1390,62 @@ pub fn spawn_user_with_arguments_and_fds(
 }
 
 pub fn spawn(entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
-    let result = spawn_into(&mut GLOBAL_SCHEDULER.lock(), entry);
+    let parent = current_runqueue().lock().current_task();
+    let result = select_runqueue().and_then(|index| {
+        let mut queue = RUN_QUEUES[index].lock();
+        spawn_child_into(&mut queue, entry, parent)
+    });
     if result.is_ok() {
         crate::smp::wake_secondaries();
     }
     result
 }
 
-fn spawn_into(scheduler: &mut Scheduler, entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
-    // Keep one slot available for the permanent idle task until it is installed.
-    if scheduler.idle_index.is_none()
-        && scheduler.tasks.iter().filter(|slot| slot.is_none()).count() <= 1
-    {
-        return Err(SchedulerError::Full);
+/// Spawn a kernel task without making it a child of the task interrupted on
+/// the current CPU.
+pub fn spawn_detached(entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
+    let result = select_runqueue().and_then(|index| {
+        let mut queue = RUN_QUEUES[index].lock();
+        if queue.idle_index.is_none() {
+            spawn_detached_into(&mut queue, entry)
+        } else {
+            queue.create_kernel_task(entry, None)
+        }
+    });
+    if result.is_ok() {
+        crate::smp::wake_secondaries();
     }
+    result
+}
+
+fn spawn_detached_into(
+    scheduler: &mut Scheduler,
+    entry: KernelTaskEntry,
+) -> Result<TaskId, SchedulerError> {
+    scheduler.check_spawn_capacity()?;
+    scheduler.create_kernel_task(entry, None)
+}
+
+#[cfg(test)]
+fn spawn_into(scheduler: &mut Scheduler, entry: KernelTaskEntry) -> Result<TaskId, SchedulerError> {
     let parent = scheduler.current_task();
+    spawn_child_into(scheduler, entry, parent)
+}
+
+fn spawn_child_into(
+    scheduler: &mut Scheduler,
+    entry: KernelTaskEntry,
+    parent: Option<TaskId>,
+) -> Result<TaskId, SchedulerError> {
+    scheduler.check_spawn_capacity()?;
     scheduler.create_kernel_task(entry, parent)
 }
 
 pub fn run_tasks() -> Result<(), SchedulerError> {
     let _interrupt_guard = InterruptGuard::new();
+    let cpu_index = current_runqueue_index();
     let next_context = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
         if scheduler.idle_index.is_none() {
             let id = scheduler.create_kernel_task(idle_task_entry, None)?;
             let index = scheduler
@@ -846,9 +1460,8 @@ pub fn run_tasks() -> Result<(), SchedulerError> {
             scheduler.idle_index = Some(index);
         }
         scheduler.start()?;
-        let current_cpu = crate::arch::syscall::current_cpu_index();
         let index = scheduler
-            .current_index(current_cpu)
+            .current_index(cpu_index)
             .ok_or(SchedulerError::NotStarted)?;
         activate_task_address_space(&scheduler, Some(index));
         &scheduler.tasks[index]
@@ -856,71 +1469,67 @@ pub fn run_tasks() -> Result<(), SchedulerError> {
             .ok_or(SchedulerError::UnknownTask)?
             .context as *const CpuContext
     };
-    let bootstrap = bootstrap_context(crate::arch::syscall::current_cpu_index());
+    let bootstrap = bootstrap_context(cpu_index);
     unsafe { leafos_context_switch(bootstrap, next_context) };
-    let idle_task = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        match scheduler.idle_index {
-            Some(index)
-                if scheduler.current_index(0).is_none()
-                    && scheduler.tasks[index]
-                        .as_ref()
-                        .is_some_and(|task| task.is_idle && task.state == TaskState::Ready) =>
-            {
-                scheduler.idle_index = None;
-                scheduler.tasks[index].take()
-            }
-            _ => None,
-        }
-    };
-    drop(idle_task);
+    complete_cpu_switch(current_runqueue_index(), true);
     Ok(())
 }
 
-/// Run the shared scheduler on a secondary CPU. Work is selected under the
-/// scheduler lock, while task execution and context switches happen outside it.
+/// Run the CPU-local scheduler on a secondary processor.
 pub fn run_secondary(cpu_index: usize) -> ! {
+    {
+        let mut queue = RUN_QUEUES[cpu_index].lock();
+        if queue.idle_index.is_none() {
+            let id = queue
+                .create_kernel_task(idle_task_entry, None)
+                .expect("could not create secondary idle task");
+            let index = queue
+                .tasks
+                .iter()
+                .position(|slot| slot.as_ref().is_some_and(|task| task.id == id))
+                .expect("secondary idle task was not inserted");
+            queue.tasks[index]
+                .as_mut()
+                .expect("secondary idle slot is empty")
+                .is_idle = true;
+            queue.idle_index = Some(index);
+        }
+    }
     loop {
-        let interrupt_guard = InterruptGuard::new();
+        let _interrupt_guard = InterruptGuard::new();
+        attempt_work_steal(cpu_index, true);
         let next_context = {
-            let mut scheduler = GLOBAL_SCHEDULER.lock();
+            let mut scheduler = RUN_QUEUES[cpu_index].lock();
             scheduler.wake_expired_sleepers(crate::time::timer::ticks());
             if scheduler.current_index(cpu_index).is_some() {
                 panic!("secondary scheduler entered with a running task");
             }
-            match scheduler.select_next(0, cpu_index) {
-                Ok(_) => {
-                    let index = scheduler
-                        .current_index(cpu_index)
-                        .expect("selected task missing from secondary CPU");
-                    activate_task_address_space(&scheduler, Some(index));
-                    Some(
-                        &scheduler.tasks[index]
-                            .as_ref()
-                            .expect("selected task slot is empty")
-                            .context as *const CpuContext,
-                    )
-                }
-                Err(SchedulerError::NoRunnableTasks) => None,
-                Err(error) => panic!("secondary scheduler failed: {:?}", error),
-            }
+            scheduler
+                .select_next(0, cpu_index)
+                .expect("secondary idle task missing");
+            let index = scheduler
+                .current_index(cpu_index)
+                .expect("secondary idle task missing");
+            activate_task_address_space(&scheduler, Some(index));
+            &scheduler.tasks[index]
+                .as_ref()
+                .expect("selected task slot is empty")
+                .context as *const CpuContext
         };
-        if let Some(next_context) = next_context {
-            unsafe {
-                leafos_context_switch(bootstrap_context(cpu_index), next_context);
-            }
-        } else {
-            drop(interrupt_guard);
-            x86_64::instructions::interrupts::enable_and_hlt();
+        // Keep bootstrap interrupts disabled until the context switch has
+        // installed the selected task's stack and register state.
+        unsafe {
+            leafos_context_switch(bootstrap_context(cpu_index), next_context);
         }
+        complete_cpu_switch(cpu_index, true);
     }
 }
 
 pub fn yield_now() -> Result<(), SchedulerError> {
     let _interrupt_guard = InterruptGuard::new();
+    let cpu_index = current_runqueue_index();
     let (old_context, next_context) = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
         let current = scheduler
             .current_index(cpu_index)
             .ok_or(SchedulerError::NotStarted)?;
@@ -929,6 +1538,7 @@ pub fn yield_now() -> Result<(), SchedulerError> {
         let next = scheduler
             .current_index(cpu_index)
             .ok_or(SchedulerError::NoRunnableTasks)?;
+        scheduler.mark_switch_pending(current, cpu_index);
         activate_task_address_space(&scheduler, Some(next));
         let old_context = &mut scheduler.tasks[current]
             .as_mut()
@@ -941,6 +1551,7 @@ pub fn yield_now() -> Result<(), SchedulerError> {
         (old_context, next_context)
     };
     unsafe { leafos_context_switch(old_context, next_context) };
+    complete_cpu_switch(current_runqueue_index(), true);
     Ok(())
 }
 
@@ -949,39 +1560,64 @@ pub fn yield_now() -> Result<(), SchedulerError> {
 /// The interrupt handler's compiler-generated register saves and hardware
 /// interrupt frame remain on the interrupted task's stack. Switching from
 /// this call boundary suspends that entire frame until the task is resumed.
-pub(crate) fn preempt_from_timer() {
+pub(crate) fn preempt_from_timer(interrupted_user_rsp: Option<u64>, force_steal: bool) {
     let _interrupt_guard = InterruptGuard::new();
+    let cpu_index = current_runqueue_index();
+    let woke_sleepers = wake_expired_sleepers_all(crate::time::timer::ticks());
+    attempt_work_steal(cpu_index, force_steal);
     let (switch, notify_secondaries) = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        let cpu_index = crate::arch::syscall::current_cpu_index();
-        let woke_sleepers = scheduler.wake_expired_sleepers(crate::time::timer::ticks());
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
         let mut notify_secondaries = woke_sleepers;
         let switch = if let Some(current) = scheduler.current_index(cpu_index) {
+            if let Some(user_rsp) = interrupted_user_rsp
+                && let Some(user) = scheduler.tasks[current]
+                    .as_mut()
+                    .and_then(|task| task.user.as_mut())
+            {
+                user.syscall_user_rsp = user_rsp;
+            }
             let kill_pending = scheduler.tasks[current]
                 .as_ref()
                 .is_some_and(|task| task.kill_pending);
-            let next_state = if kill_pending {
-                let task_id = scheduler.tasks[current]
-                    .as_ref()
+            if kill_pending {
+                scheduler.tasks[current]
+                    .as_mut()
                     .expect("interrupted task slot is empty")
-                    .id;
-                crate::gui::close_windows_owned(task_id.get());
+                    .switch_pending_cpu = Some(cpu_index);
+                scheduler.tasks[current]
+                    .as_mut()
+                    .expect("interrupted task slot is empty")
+                    .cleanup_pending = true;
+            }
+            let next_state = if kill_pending {
                 scheduler.wake_parent(current);
                 notify_secondaries = true;
                 TaskState::Terminated
             } else {
                 TaskState::Ready
             };
+            if scheduler.tasks[current]
+                .as_ref()
+                .is_some_and(|task| task.is_idle)
+            {
+                SCHEDULER_STATS[cpu_index]
+                    .idle_ticks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             let no_runnable_tasks = match scheduler.transition_current(next_state) {
                 Ok(_) => false,
                 Err(SchedulerError::NoRunnableTasks) => true,
                 Err(error) => panic!("timer preemption failed: {:?}", error),
             };
+            scheduler.mark_switch_pending(current, cpu_index);
 
             match scheduler.current_index(cpu_index) {
                 Some(next) if next == current && !kill_pending => None,
                 Some(next) => {
                     activate_task_address_space(&scheduler, Some(next));
+                    SCHEDULER_STATS[cpu_index]
+                        .timer_preemptions
+                        .fetch_add(1, Ordering::Relaxed);
                     let old_context = &mut scheduler.tasks[current]
                         .as_mut()
                         .expect("interrupted task slot is empty")
@@ -994,11 +1630,17 @@ pub(crate) fn preempt_from_timer() {
                 }
                 None if kill_pending || no_runnable_tasks => {
                     activate_task_address_space(&scheduler, None);
+                    SCHEDULER_STATS[cpu_index]
+                        .timer_preemptions
+                        .fetch_add(1, Ordering::Relaxed);
                     let old_context = &mut scheduler.tasks[current]
                         .as_mut()
                         .expect("interrupted task slot is empty")
                         .context as *mut CpuContext;
-                    Some((old_context, bootstrap_context(cpu_index) as *const CpuContext))
+                    Some((
+                        old_context,
+                        bootstrap_context(cpu_index) as *const CpuContext,
+                    ))
                 }
                 None => None,
             }
@@ -1013,6 +1655,7 @@ pub(crate) fn preempt_from_timer() {
     }
     if let Some((old_context, next_context)) = switch {
         unsafe { leafos_context_switch(old_context, next_context) };
+        complete_cpu_switch(current_runqueue_index(), false);
     }
 }
 
@@ -1021,9 +1664,9 @@ pub(crate) fn preempt_from_timer() {
 /// returns `Ok(())`.
 pub fn block_now() -> Result<(), SchedulerError> {
     let _interrupt_guard = InterruptGuard::new();
+    let cpu_index = current_runqueue_index();
     let (old_context, next_context) = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
         let current = scheduler
             .current_index(cpu_index)
             .ok_or(SchedulerError::NotStarted)?;
@@ -1033,6 +1676,7 @@ pub fn block_now() -> Result<(), SchedulerError> {
             Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
             Err(error) => return Err(error),
         }
+        scheduler.mark_switch_pending(current, cpu_index);
 
         let old_context = &mut scheduler.tasks[current]
             .as_mut()
@@ -1054,6 +1698,7 @@ pub fn block_now() -> Result<(), SchedulerError> {
         (old_context, next_context)
     };
     unsafe { leafos_context_switch(old_context, next_context) };
+    complete_cpu_switch(current_runqueue_index(), true);
     Ok(())
 }
 
@@ -1065,9 +1710,9 @@ pub fn sleep_ticks(duration: u64) -> Result<(), SchedulerError> {
     }
     let _interrupt_guard = InterruptGuard::new();
     let deadline = crate::time::timer::ticks().wrapping_add(duration);
+    let cpu_index = current_runqueue_index();
     let (old_context, next_context) = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
         let current = scheduler
             .current_index(cpu_index)
             .ok_or(SchedulerError::NotStarted)?;
@@ -1076,6 +1721,7 @@ pub fn sleep_ticks(duration: u64) -> Result<(), SchedulerError> {
             Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
             Err(error) => return Err(error),
         }
+        scheduler.mark_switch_pending(current, cpu_index);
         let old_context = &mut scheduler.tasks[current]
             .as_mut()
             .ok_or(SchedulerError::UnknownTask)?
@@ -1096,52 +1742,61 @@ pub fn sleep_ticks(duration: u64) -> Result<(), SchedulerError> {
         (old_context, next_context)
     };
     unsafe { leafos_context_switch(old_context, next_context) };
+    complete_cpu_switch(current_runqueue_index(), true);
     Ok(())
 }
 
 fn idle_task_entry() {
     loop {
-        let context_to_bootstrap = {
-            let mut scheduler = GLOBAL_SCHEDULER.lock();
-            scheduler.wake_expired_sleepers(crate::time::timer::ticks());
-            if !scheduler.has_live_non_idle_tasks() {
-                let current = scheduler.current_index(0).expect("idle task without current task");
-                let idle = scheduler.tasks[current]
+        #[cfg(test)]
+        if current_runqueue_index() == 0 && !has_live_non_idle_tasks() {
+            let _interrupt_guard = InterruptGuard::new();
+            let (old_context, next_context) = {
+                let mut scheduler = RUN_QUEUES[0].lock();
+                let Some(current) = scheduler.current_index(0) else {
+                    panic!("test idle task lost its runqueue slot");
+                };
+                let task = scheduler.tasks[current]
                     .as_mut()
-                    .expect("current idle task slot is empty");
-                assert!(idle.is_idle, "non-idle task entered idle loop");
-                idle.state = TaskState::Ready;
+                    .expect("test idle task slot is empty");
+                assert!(task.is_idle, "test scheduler switched to a non-idle task");
+                task.state = TaskState::Ready;
                 scheduler.set_current_index(0, None);
                 activate_task_address_space(&scheduler, None);
-                Some(
+                (
                     &mut scheduler.tasks[current]
                         .as_mut()
-                        .expect("current idle task slot is empty")
+                        .expect("test idle task disappeared")
                         .context as *mut CpuContext,
+                    bootstrap_context(0) as *const CpuContext,
                 )
-            } else {
-                None
-            }
-        };
-        if let Some(idle_context) = context_to_bootstrap {
-            unsafe {
-                leafos_context_switch(idle_context, bootstrap_context(0) as *const CpuContext);
-            }
-            continue;
+            };
+            unsafe { leafos_context_switch(old_context, next_context) };
+            complete_cpu_switch(0, true);
         }
-        // Hand control to any task that just became runnable before idling.
-        let _ = yield_now();
-        // Interrupts are enabled atomically with halting, so a PIT tick cannot
-        // be lost between checking deadlines and sleeping the CPU.
+        let cpu_index = current_runqueue_index();
+        if attempt_work_steal(cpu_index, false) {
+            yield_now().expect("idle task could not schedule a stolen task");
+        }
         x86_64::instructions::interrupts::enable_and_hlt();
     }
+}
+
+fn wake_expired_sleepers_all(now: u64) -> bool {
+    let mut woke_any = false;
+    for (index, runqueue) in RUN_QUEUES.iter().enumerate() {
+        if online_runqueue(index) {
+            woke_any |= runqueue.lock().wake_expired_sleepers(now);
+        }
+    }
+    woke_any
 }
 
 /// Wake a blocked task. Waking changes its state to `Ready` but does not
 /// preempt a currently running task. If the scheduler is idle, call
 /// `run_tasks()` to resume scheduling from the bootstrap context.
 pub fn wake_task(id: TaskId) -> Result<(), SchedulerError> {
-    let result = GLOBAL_SCHEDULER.lock().wake(id);
+    let result = with_task_queue(id, |_, queue| queue.wake(id));
     if result.is_ok() {
         crate::smp::wake_secondaries();
     }
@@ -1150,30 +1805,61 @@ pub fn wake_task(id: TaskId) -> Result<(), SchedulerError> {
 
 /// Terminate a non-running task from kernel control code.
 pub fn terminate_task(id: TaskId, exit_code: u64) -> Result<(), SchedulerError> {
-    let result = GLOBAL_SCHEDULER.lock().terminate_task(id, exit_code);
+    let (index, parent, result) = with_task_queue(id, |index, queue| {
+        let parent = queue.task(id).ok().and_then(|task| task.parent);
+        Ok((index, parent, queue.terminate_task(id, exit_code)))
+    })?;
+    if let Some(parent) = parent {
+        let _ = wake_task(parent);
+    }
     if result.is_ok() {
+        complete_cpu_switch(index, true);
         crate::smp::wake_secondaries();
     }
     result
 }
 
+/// Request termination of a task that may currently be executing on another
+/// CPU. Closed terminal tasks are reaped after their context has been switched
+/// off its stack.
+pub fn request_terminate_task(id: TaskId, exit_code: u64) -> Result<(), SchedulerError> {
+    let (index, parent, running) = with_task_queue(id, |index, scheduler| {
+        let parent = scheduler.task(id).ok().and_then(|task| task.parent);
+        let running = scheduler.request_terminate_task(id, exit_code)?;
+        Ok((index, parent, running))
+    })?;
+    if !running && let Some(parent) = parent {
+        let _ = wake_task(parent);
+    }
+    if running {
+        crate::smp::wake_secondaries();
+    } else {
+        complete_cpu_switch(index, true);
+    }
+    Ok(())
+}
+
 /// Wake tasks waiting for descriptor activity or another external event.
 pub fn wake_all_blocked_tasks() {
-    GLOBAL_SCHEDULER.lock().wake_all_blocked();
+    for (index, runqueue) in RUN_QUEUES.iter().enumerate() {
+        if online_runqueue(index) {
+            runqueue.lock().wake_all_blocked();
+        }
+    }
     crate::smp::wake_secondaries();
 }
 
 /// Return whether the currently executing scheduled task is a user task.
 pub fn current_task_is_user() -> bool {
-    let scheduler = GLOBAL_SCHEDULER.lock();
+    let scheduler = current_runqueue().lock();
     scheduler
-        .current_index(crate::arch::syscall::current_cpu_index())
+        .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .is_some_and(|task| task.user.is_some())
 }
 
 pub fn current_task_id() -> Option<TaskId> {
-    GLOBAL_SCHEDULER.lock().current_task()
+    current_runqueue().lock().current_task()
 }
 
 /// Check a user buffer against the running task's address-space metadata.
@@ -1183,9 +1869,9 @@ pub fn validate_current_user_range(
     length: usize,
     writable: bool,
 ) -> Result<(), memory::UserMemoryError> {
-    let scheduler = GLOBAL_SCHEDULER.lock();
+    let scheduler = current_runqueue().lock();
     let task = scheduler
-        .current_index(crate::arch::syscall::current_cpu_index())
+        .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .and_then(|task| task.user.as_ref())
         .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
@@ -1198,9 +1884,9 @@ pub fn copy_from_current_user(
     address: u64,
     output: &mut [u8],
 ) -> Result<(), memory::UserMemoryError> {
-    let scheduler = GLOBAL_SCHEDULER.lock();
+    let scheduler = current_runqueue().lock();
     let task = scheduler
-        .current_index(crate::arch::syscall::current_cpu_index())
+        .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .and_then(|task| task.user.as_ref())
         .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
@@ -1209,9 +1895,9 @@ pub fn copy_from_current_user(
 
 /// Copy syscall output to a writable buffer in the currently running task.
 pub fn copy_to_current_user(address: u64, input: &[u8]) -> Result<(), memory::UserMemoryError> {
-    let scheduler = GLOBAL_SCHEDULER.lock();
+    let scheduler = current_runqueue().lock();
     let task = scheduler
-        .current_index(crate::arch::syscall::current_cpu_index())
+        .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .and_then(|task| task.user.as_ref())
         .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
@@ -1241,53 +1927,75 @@ fn exit_current_with_status(exit_code: Option<u64>) -> ! {
 
 fn exit_current_with_status_and_group(exit_code: Option<u64>, terminate_group: bool) -> ! {
     let _interrupt_guard = InterruptGuard::new();
+    let cpu_index = current_runqueue_index();
+    let (current_id, parent_id) = {
+        let queue = RUN_QUEUES[cpu_index].lock();
+        let current = queue
+            .current_index(cpu_index)
+            .expect("task exit without current task");
+        let task = queue.tasks[current]
+            .as_ref()
+            .expect("current task slot is empty");
+        (task.id, task.parent)
+    };
+
+    let mut group_members = Vec::new();
+    if terminate_group && let Some(parent) = parent_id {
+        let _migration_guard = TASK_MIGRATION_LOCK.lock();
+        for runqueue in RUN_QUEUES.iter() {
+            let queue = runqueue.lock();
+            group_members.extend(
+                queue
+                    .tasks
+                    .iter()
+                    .flatten()
+                    .filter(|task| task.id != current_id && task.parent == Some(parent))
+                    .map(|task| task.id),
+            );
+        }
+    }
+
+    let mut notify_secondaries = false;
+    for sibling in group_members {
+        let (sibling_parent, newly_terminated) = match with_task_queue(sibling, |_, queue| {
+            queue.terminate_group_member(sibling, exit_code)
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                crate::serial_println!(
+                    "[WARN] Could not terminate sibling task {}: {:?}",
+                    sibling.get(),
+                    error
+                );
+                continue;
+            }
+        };
+        if !newly_terminated && crate::scheduler::task_state(sibling) == Ok(TaskState::Running) {
+            notify_secondaries = true;
+        }
+        if let Some(parent) = sibling_parent {
+            let _ = wake_task(parent);
+        }
+    }
+
     let (old_context, next_context) = {
-        let mut scheduler = GLOBAL_SCHEDULER.lock();
-        let cpu_index = crate::arch::syscall::current_cpu_index();
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
         let current = scheduler
             .current_index(cpu_index)
             .expect("task exit without current task");
         save_current_user_rsp(&mut scheduler, current);
-        let current_owner = scheduler.tasks[current]
-            .as_ref()
-            .map(|task| task.id.get())
-            .unwrap_or(0);
-        crate::gui::close_windows_owned(current_owner);
-        if terminate_group {
-            let parent = scheduler.tasks[current]
-                .as_ref()
-                .and_then(|task| task.parent);
-            if let Some(parent) = parent {
-                for index in 0..MAX_TASKS {
-                    if index == current
-                        || !scheduler.tasks[index]
-                            .as_ref()
-                            .is_some_and(|task| task.parent == Some(parent))
-                    {
-                        continue;
-                    }
-                    let running = scheduler.task_is_running(index);
-                    let Some(sibling) = scheduler.tasks[index].as_mut() else {
-                        continue;
-                    };
-                    if sibling.state == TaskState::Terminated {
-                        continue;
-                    }
-                    sibling.exit_code = exit_code;
-                    if running {
-                        sibling.kill_pending = true;
-                    } else {
-                        crate::gui::close_windows_owned(sibling.id.get());
-                        sibling.state = TaskState::Terminated;
-                        scheduler.wake_parent(index);
-                    }
-                }
-            }
-        }
         scheduler.tasks[current]
             .as_mut()
             .expect("current task slot is empty")
             .exit_code = exit_code;
+        scheduler.tasks[current]
+            .as_mut()
+            .expect("current task slot is empty")
+            .cleanup_pending = true;
+        scheduler.tasks[current]
+            .as_mut()
+            .expect("current task slot is empty")
+            .switch_pending_cpu = Some(cpu_index);
         scheduler.wake_parent(current);
 
         match scheduler.transition_current(TaskState::Terminated) {
@@ -1299,38 +2007,39 @@ fn exit_current_with_status_and_group(exit_code: Option<u64>, terminate_group: b
             .as_mut()
             .expect("terminated task slot is empty")
             .context as *mut CpuContext;
-        let next_context = match scheduler.current_index(cpu_index) {
-            Some(next) => {
-                activate_task_address_space(&scheduler, Some(next));
-                &scheduler.tasks[next]
-                    .as_ref()
-                    .expect("selected task slot is empty")
-                    .context as *const CpuContext
-            }
-            None => {
-                activate_task_address_space(&scheduler, None);
-                bootstrap_context(cpu_index) as *const CpuContext
-            }
-        };
+        let next = scheduler
+            .current_index(cpu_index)
+            .expect("idle task missing");
+        activate_task_address_space(&scheduler, Some(next));
+        let next_context = &scheduler.tasks[next]
+            .as_ref()
+            .expect("selected task slot is empty")
+            .context as *const CpuContext;
         (old_context, next_context)
     };
-    crate::smp::wake_secondaries();
+    if let Some(parent) = parent_id {
+        let _ = wake_task(parent);
+    }
+    if notify_secondaries || terminate_group {
+        crate::smp::wake_secondaries();
+    }
     unsafe { leafos_context_switch(old_context, next_context) };
+    complete_cpu_switch(current_runqueue_index(), true);
     unreachable!("a terminated task must never resume")
 }
 
 pub fn task_state(id: TaskId) -> Result<TaskState, SchedulerError> {
-    GLOBAL_SCHEDULER.lock().task_state(id)
+    with_task_queue(id, |_, queue| queue.task_state(id))
 }
 
 pub fn task_parent(id: TaskId) -> Result<Option<TaskId>, SchedulerError> {
-    GLOBAL_SCHEDULER.lock().task(id).map(|task| task.parent)
+    with_task_queue(id, |_, queue| queue.task(id).map(|task| task.parent))
 }
 
 pub fn read_current_fd(fd_number: usize, output: &mut [u8]) -> Result<usize, SchedulerError> {
-    let scheduler = GLOBAL_SCHEDULER.lock();
+    let scheduler = current_runqueue().lock();
     let task = scheduler
-        .current_index(crate::arch::syscall::current_cpu_index())
+        .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .ok_or(SchedulerError::NotStarted)?;
     let descriptor = task
@@ -1346,9 +2055,9 @@ pub fn read_current_fd(fd_number: usize, output: &mut [u8]) -> Result<usize, Sch
 }
 
 pub fn write_current_fd(fd_number: usize, input: &[u8]) -> Result<usize, SchedulerError> {
-    let scheduler = GLOBAL_SCHEDULER.lock();
+    let scheduler = current_runqueue().lock();
     let task = scheduler
-        .current_index(crate::arch::syscall::current_cpu_index())
+        .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .ok_or(SchedulerError::NotStarted)?;
     let descriptor = task
@@ -1367,7 +2076,7 @@ pub fn write_current_fd(fd_number: usize, input: &[u8]) -> Result<usize, Schedul
 pub fn create_file_write_for_current(path: &str) -> Result<usize, SchedulerError> {
     let _interrupt_guard = InterruptGuard::new();
     let file_fd = {
-        let scheduler = GLOBAL_SCHEDULER.lock();
+        let scheduler = current_runqueue().lock();
         let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
         let task = scheduler.tasks[current]
             .as_ref()
@@ -1375,7 +2084,7 @@ pub fn create_file_write_for_current(path: &str) -> Result<usize, SchedulerError
         find_free_fd(&task.fds).ok_or(SchedulerError::Full)?
     };
     let descriptor = fd::create_file_write(path).map_err(|_| SchedulerError::Io)?;
-    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let mut scheduler = current_runqueue().lock();
     let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
     let task = scheduler.tasks[current]
         .as_mut()
@@ -1390,7 +2099,7 @@ pub fn create_file_write_for_current(path: &str) -> Result<usize, SchedulerError
 pub fn create_file_read_for_current(path: &str) -> Result<usize, SchedulerError> {
     let _interrupt_guard = InterruptGuard::new();
     let file_fd = {
-        let scheduler = GLOBAL_SCHEDULER.lock();
+        let scheduler = current_runqueue().lock();
         let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
         let task = scheduler.tasks[current]
             .as_ref()
@@ -1398,7 +2107,7 @@ pub fn create_file_read_for_current(path: &str) -> Result<usize, SchedulerError>
         find_free_fd(&task.fds).ok_or(SchedulerError::Full)?
     };
     let descriptor = fd::create_file_read(path).map_err(|_| SchedulerError::Io)?;
-    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let mut scheduler = current_runqueue().lock();
     let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
     let task = scheduler.tasks[current]
         .as_mut()
@@ -1412,7 +2121,7 @@ pub fn create_file_read_for_current(path: &str) -> Result<usize, SchedulerError>
 
 pub fn create_pipe_for_current() -> Result<(usize, usize), SchedulerError> {
     let (read_end, write_end) = fd::create_pipe().ok_or(SchedulerError::Full)?;
-    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let mut scheduler = current_runqueue().lock();
     let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
     let task = scheduler.tasks[current]
         .as_mut()
@@ -1424,7 +2133,7 @@ pub fn create_pipe_for_current() -> Result<(usize, usize), SchedulerError> {
 }
 
 pub fn close_current_fd(fd_number: usize) -> Result<(), SchedulerError> {
-    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let mut scheduler = current_runqueue().lock();
     let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
     let task = scheduler
         .tasks
@@ -1447,7 +2156,7 @@ pub fn duplicate_current_fd(source_fd: usize, target_fd: usize) -> Result<(), Sc
         return Err(SchedulerError::InvalidFd);
     }
     if source_fd == target_fd {
-        let scheduler = GLOBAL_SCHEDULER.lock();
+        let scheduler = current_runqueue().lock();
         let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
         if scheduler.tasks[current]
             .as_ref()
@@ -1459,7 +2168,7 @@ pub fn duplicate_current_fd(source_fd: usize, target_fd: usize) -> Result<(), Sc
         return Err(SchedulerError::InvalidFd);
     }
 
-    let mut scheduler = GLOBAL_SCHEDULER.lock();
+    let mut scheduler = current_runqueue().lock();
     let current = running_task_index(&scheduler).ok_or(SchedulerError::NotStarted)?;
     let task = scheduler
         .tasks
@@ -1484,40 +2193,52 @@ pub fn duplicate_current_fd(source_fd: usize, target_fd: usize) -> Result<(), Sc
 pub fn wait_for_child(child: Option<TaskId>) -> Result<(TaskId, Option<u64>), SchedulerError> {
     loop {
         let _interrupt_guard = InterruptGuard::new();
+        let cpu_index = current_runqueue_index();
+        let parent = RUN_QUEUES[cpu_index]
+            .lock()
+            .current_task()
+            .ok_or(SchedulerError::NotStarted)?;
+        RUN_QUEUES[cpu_index].lock().set_waiting_for_child(true)?;
+        if let Some(child_id) = child {
+            let child_parent = match with_task_queue(child_id, |_, queue| {
+                queue.task(child_id).map(|task| task.parent)
+            }) {
+                Ok(parent) => parent,
+                Err(error) => {
+                    RUN_QUEUES[cpu_index].lock().set_waiting_for_child(false)?;
+                    return Err(error);
+                }
+            };
+            if child_parent != Some(parent) {
+                RUN_QUEUES[cpu_index].lock().set_waiting_for_child(false)?;
+                return Err(SchedulerError::NotChild);
+            }
+        }
+
+        match find_terminated_child(parent, child) {
+            Ok((child_id, exit_code)) => {
+                RUN_QUEUES[cpu_index].lock().set_waiting_for_child(false)?;
+                reap_terminated(child_id)?;
+                return Ok((child_id, exit_code));
+            }
+            Err(SchedulerError::ChildRunning) => {}
+            Err(error) => {
+                RUN_QUEUES[cpu_index].lock().set_waiting_for_child(false)?;
+                return Err(error);
+            }
+        }
+
         let (old_context, next_context) = {
-            let mut scheduler = GLOBAL_SCHEDULER.lock();
-            let cpu_index = crate::arch::syscall::current_cpu_index();
+            let mut scheduler = RUN_QUEUES[cpu_index].lock();
             let current = scheduler
                 .current_index(cpu_index)
                 .ok_or(SchedulerError::NotStarted)?;
-            let parent = scheduler.tasks[current]
-                .as_ref()
-                .ok_or(SchedulerError::UnknownTask)?
-                .id;
-
-            if let Some(child_id) = child {
-                let child_task = scheduler.task(child_id)?;
-                if child_task.parent != Some(parent) {
-                    return Err(SchedulerError::NotChild);
-                }
-            }
-
-            match scheduler.terminated_child(parent, child) {
-                Ok(child_id) => {
-                    let exit_code = scheduler.task(child_id)?.exit_code;
-                    scheduler.reap_terminated(child_id)?;
-                    return Ok((child_id, exit_code));
-                }
-                Err(SchedulerError::UnknownTask) if child.is_some() => {
-                    return Err(SchedulerError::UnknownTask);
-                }
-                Err(SchedulerError::NoChild) => return Err(SchedulerError::NoChild),
-                Err(SchedulerError::ChildRunning) | Err(SchedulerError::UnknownTask) => {}
+            save_current_user_rsp(&mut scheduler, current);
+            match scheduler.transition_current(TaskState::Blocked) {
+                Ok(_) | Err(SchedulerError::NoRunnableTasks) => {}
                 Err(error) => return Err(error),
             }
-
-            save_current_user_rsp(&mut scheduler, current);
-            scheduler.transition_current(TaskState::Blocked)?;
+            scheduler.mark_switch_pending(current, cpu_index);
             let old_context = &mut scheduler.tasks[current]
                 .as_mut()
                 .ok_or(SchedulerError::UnknownTask)?
@@ -1538,27 +2259,273 @@ pub fn wait_for_child(child: Option<TaskId>) -> Result<(TaskId, Option<u64>), Sc
             (old_context, next_context)
         };
         unsafe { leafos_context_switch(old_context, next_context) };
+        complete_cpu_switch(current_runqueue_index(), true);
     }
 }
 
 /// Return a terminated task's exit code, or `None` if it failed or was a kernel task.
 pub fn task_exit_code(id: TaskId) -> Result<Option<u64>, SchedulerError> {
-    GLOBAL_SCHEDULER.lock().task(id).map(|task| task.exit_code)
+    with_task_queue(id, |_, queue| queue.task(id).map(|task| task.exit_code))
 }
 
 pub fn task_snapshot() -> [Option<TaskInfo>; MAX_TASKS] {
-    GLOBAL_SCHEDULER.lock().task_snapshot()
+    let mut snapshot = [None; MAX_TASKS];
+    let mut next = 0;
+    for runqueue in RUN_QUEUES.iter() {
+        let queue = runqueue.lock();
+        for task in queue.tasks.iter().flatten() {
+            snapshot[next] = Some(TaskInfo {
+                id: task.id,
+                parent: task.parent,
+                state: task.state,
+                exit_code: task.exit_code,
+                is_idle: task.is_idle,
+                is_user: task.user.is_some(),
+            });
+            next += 1;
+        }
+    }
+    snapshot
+}
+
+pub fn scheduler_stats() -> SchedulerStats {
+    let mut cpus = [None; crate::arch::syscall::MAX_CPUS];
+    for (index, runqueue) in RUN_QUEUES.iter().enumerate() {
+        if !online_runqueue(index) {
+            continue;
+        }
+        let queue = runqueue.lock();
+        let runnable_tasks = runnable_task_count(&queue, index);
+        let counters = &SCHEDULER_STATS[index];
+        cpus[index] = Some(CpuSchedulerStats {
+            context_switches: counters.context_switches.load(Ordering::Relaxed),
+            timer_preemptions: counters.timer_preemptions.load(Ordering::Relaxed),
+            idle_ticks: counters.idle_ticks.load(Ordering::Relaxed),
+            tasks_executed: counters.tasks_executed.load(Ordering::Relaxed),
+            runnable_tasks,
+            steal_attempts: counters.steal_attempts.load(Ordering::Relaxed),
+            successful_steals: counters.successful_steals.load(Ordering::Relaxed),
+        });
+    }
+    SchedulerStats {
+        cpus,
+        work_stealing_events: TOTAL_SUCCESSFUL_STEALS.load(Ordering::Relaxed),
+    }
+}
+
+pub fn cpu_is_idle(cpu_index: usize) -> Option<bool> {
+    let queue = RUN_QUEUES.get(cpu_index)?.lock();
+    let current = queue.current_index(cpu_index)?;
+    queue.tasks.get(current)?.as_ref().map(|task| task.is_idle)
 }
 
 pub fn reap_terminated(id: TaskId) -> Result<(), SchedulerError> {
-    GLOBAL_SCHEDULER.lock().reap_terminated(id)
+    let index = find_task_queue(id)?;
+    reap_task_from_runqueue(index, id, false)
+}
+
+#[cfg(test)]
+static SMP_STEAL_TEST_CPU: AtomicU64 = AtomicU64::new(u64::MAX);
+#[cfg(test)]
+static SMP_STEAL_TEST_RUNS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+fn smp_steal_test_task() {
+    SMP_STEAL_TEST_RUNS.fetch_add(1, Ordering::SeqCst);
+    SMP_STEAL_TEST_CPU.store(current_runqueue_index() as u64, Ordering::Release);
+}
+
+#[cfg(test)]
+pub fn run_smp_work_stealing_test() {
+    serial_println!("SMP work-stealing integration...");
+    SMP_STEAL_TEST_CPU.store(u64::MAX, Ordering::Relaxed);
+    SMP_STEAL_TEST_RUNS.store(0, Ordering::Relaxed);
+    let steals_before = scheduler_stats().work_stealing_events;
+    let task = spawn_detached(smp_steal_test_task).expect("queue SMP migration test task");
+    let started = crate::smp::start_secondaries();
+    assert!(
+        started >= 2,
+        "SMP integration test requires two secondary CPUs"
+    );
+
+    let start = crate::time::timer::ticks();
+    loop {
+        if task_state(task) == Ok(TaskState::Terminated) {
+            break;
+        }
+        assert!(
+            crate::time::timer::ticks().wrapping_sub(start)
+                < 5 * crate::time::timer::TICKS_PER_SECOND,
+            "SMP migration task did not finish"
+        );
+        x86_64::instructions::interrupts::enable_and_hlt();
+    }
+
+    let task_cpu = SMP_STEAL_TEST_CPU.load(Ordering::Acquire) as usize;
+    assert!(
+        task_cpu > 0,
+        "test task did not migrate off the bootstrap CPU"
+    );
+    assert!(
+        crate::smp::cpu_is_online(task_cpu),
+        "task ran on an offline CPU"
+    );
+    assert_eq!(
+        SMP_STEAL_TEST_RUNS.load(Ordering::SeqCst),
+        1,
+        "migrated task must execute exactly once"
+    );
+    assert!(
+        scheduler_stats().work_stealing_events > steals_before,
+        "work-steal statistics did not record the migration"
+    );
+    serial_println!(
+        "[OK] Task {} migrated to CPU {}; successful steals={}",
+        task.get(),
+        task_cpu,
+        scheduler_stats().work_stealing_events - steals_before
+    );
+}
+
+fn reap_task_from_runqueue(index: usize, id: TaskId, reserved: bool) -> Result<(), SchedulerError> {
+    let mut user = RUN_QUEUES[index].lock().begin_reap(id, reserved)?;
+    if let Some(user_task) = user.as_mut() {
+        if user_task.address_space.destroy().is_err() {
+            RUN_QUEUES[index].lock().abort_reap(id, user);
+            return Err(SchedulerError::AddressSpaceCleanup);
+        }
+    }
+
+    let task = RUN_QUEUES[index].lock().finish_reap(id)?;
+    crate::gui::close_windows_owned(id.get());
+    drop(task);
+    Ok(())
+}
+
+fn process_deferred_cleanup() {
+    for (queue_index, runqueue) in RUN_QUEUES.iter().enumerate() {
+        if !online_runqueue(queue_index) {
+            continue;
+        }
+        let (cleanup_tasks, reap_tasks) = {
+            let mut scheduler = runqueue.lock();
+            let mut cleanup_tasks = [None; PER_CORE_MAX_TASKS];
+            let mut cleanup_count = 0;
+            let mut reap_tasks = [None; PER_CORE_MAX_TASKS];
+            let mut reap_count = 0;
+            for index in 0..PER_CORE_MAX_TASKS {
+                let ready_for_cleanup = scheduler.tasks[index].as_ref().is_some_and(|task| {
+                    task.cleanup_pending
+                        && task.state == TaskState::Terminated
+                        && task.switch_pending_cpu.is_none()
+                        && !scheduler.task_is_running(index)
+                });
+                if ready_for_cleanup {
+                    let task = scheduler.tasks[index]
+                        .as_mut()
+                        .expect("cleanup task disappeared");
+                    task.cleanup_pending = false;
+                    cleanup_tasks[cleanup_count] = Some(task.id);
+                    cleanup_count += 1;
+                }
+
+                let reap = scheduler.tasks[index].as_ref().is_some_and(|task| {
+                    task.auto_reap
+                        && task.state == TaskState::Terminated
+                        && task.switch_pending_cpu.is_none()
+                        && !task.reaping
+                        && !scheduler.task_is_running(index)
+                });
+                if reap {
+                    let task = scheduler.tasks[index]
+                        .as_mut()
+                        .expect("auto-reap task disappeared");
+                    task.reaping = true;
+                    reap_tasks[reap_count] = Some(task.id);
+                    reap_count += 1;
+                }
+            }
+            (cleanup_tasks, reap_tasks)
+        };
+        for task in cleanup_tasks.into_iter().flatten() {
+            crate::gui::close_windows_owned(task.get());
+        }
+        for task in reap_tasks.into_iter().flatten() {
+            if let Err(error) = reap_task_from_runqueue(queue_index, task, true) {
+                crate::serial_println!(
+                    "[WARN] Could not reap terminated task {}: {:?}",
+                    task.get(),
+                    error
+                );
+            }
+        }
+    }
+}
+
+fn complete_cpu_switch(cpu_index: usize, allow_cleanup: bool) {
+    let owns_runqueue = cpu_index == current_runqueue_index();
+    let (should_notify, parents) = {
+        let mut scheduler = RUN_QUEUES[cpu_index].lock();
+        SCHEDULER_STATS[cpu_index]
+            .context_switches
+            .fetch_add(1, Ordering::Relaxed);
+        if scheduler
+            .current_index(cpu_index)
+            .and_then(|index| scheduler.tasks[index].as_ref())
+            .is_some_and(|task| !task.is_idle)
+        {
+            SCHEDULER_STATS[cpu_index]
+                .tasks_executed
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut changed = false;
+        let mut parents = [None; PER_CORE_MAX_TASKS];
+        let mut parent_count = 0;
+        if owns_runqueue {
+            for index in 0..PER_CORE_MAX_TASKS {
+                if scheduler.tasks[index]
+                    .as_ref()
+                    .is_some_and(|task| task.switch_pending_cpu == Some(cpu_index))
+                {
+                    if let Some(task) = scheduler.tasks[index].as_mut() {
+                        task.switch_pending_cpu = None;
+                        if task.state == TaskState::Terminated {
+                            if let Some(parent) = task.parent {
+                                parents[parent_count] = Some(parent);
+                                parent_count += 1;
+                            }
+                            changed = true;
+                        }
+                    }
+                    if scheduler.tasks[index]
+                        .as_ref()
+                        .is_some_and(|task| task.state == TaskState::Terminated)
+                    {
+                        scheduler.wake_parent(index);
+                    }
+                }
+            }
+        }
+        (changed, parents)
+    };
+    for parent in parents.into_iter().flatten() {
+        let _ = wake_task(parent);
+    }
+    if should_notify {
+        crate::smp::wake_secondaries();
+    }
+    if allow_cleanup {
+        process_deferred_cleanup();
+    }
+    notify_one_idle_cpu(cpu_index);
 }
 
 extern "C" fn task_trampoline() -> ! {
+    complete_cpu_switch(current_runqueue_index(), true);
     let (entry, user_context, stack_top) = {
-        let scheduler = GLOBAL_SCHEDULER.lock();
+        let scheduler = current_runqueue().lock();
         let current = scheduler
-            .current_index(crate::arch::syscall::current_cpu_index())
+            .current_index(current_runqueue_index())
             .expect("task trampoline without current task");
         let task = scheduler.tasks[current]
             .as_ref()
@@ -1715,6 +2682,183 @@ fn scheduler_terminates_non_running_task_and_retains_exit_code() {
 }
 
 #[test_case]
+fn migration_moves_a_ready_kernel_task_with_its_stack_and_saved_context() {
+    let mut source = RunQueue::new();
+    let mut destination = RunQueue::new();
+    let context = CpuContext {
+        stack_pointer: 0x1234,
+        rbx: 1,
+        rbp: 2,
+        r12: 3,
+        r13: 4,
+        r14: 5,
+        r15: 6,
+        rflags: 0x202,
+    };
+    let id = source
+        .create_kernel_task(dummy_kernel_task, None)
+        .expect("create migratable kernel task");
+    let source_index = source
+        .tasks
+        .iter()
+        .position(|task| task.as_ref().is_some_and(|task| task.id == id))
+        .expect("find source task");
+    source.tasks[source_index]
+        .as_mut()
+        .expect("source task disappeared")
+        .context = context;
+    let stack_top = source.tasks[source_index]
+        .as_ref()
+        .and_then(|task| task.stack_top);
+    assert!(stack_top.is_some());
+
+    assert_eq!(migrate_ready_task(&mut source, &mut destination, 1), Ok(id));
+    assert!(source.task(id).is_err());
+    let migrated = destination.task(id).expect("find migrated task");
+    assert_eq!(migrated.state, TaskState::Ready);
+    assert_eq!(migrated.context, context);
+    assert_eq!(migrated.stack_top, stack_top);
+    assert!(migrated._stack.is_some());
+    assert_eq!(migrated.cpu_affinity, None);
+}
+
+#[test_case]
+fn migration_rejects_running_blocked_sleeping_terminated_and_switching_tasks() {
+    let mut source = RunQueue::new();
+    let mut destination = RunQueue::new();
+    for _ in 0..PER_CORE_MAX_TASKS {
+        source
+            .create_task(CpuContext::empty())
+            .expect("create source task");
+    }
+
+    source.current = Some(0);
+    source.tasks[0].as_mut().unwrap().state = TaskState::Running;
+    source.tasks[1].as_mut().unwrap().state = TaskState::Blocked;
+    source.tasks[2].as_mut().unwrap().state = TaskState::Sleeping;
+    source.tasks[3].as_mut().unwrap().state = TaskState::Terminated;
+    source.tasks[4].as_mut().unwrap().switch_pending_cpu = Some(0);
+    source.tasks[5].as_mut().unwrap().kill_pending = true;
+    source.tasks[6].as_mut().unwrap().cleanup_pending = true;
+    source.tasks[7].as_mut().unwrap().reaping = true;
+
+    assert_eq!(
+        migrate_ready_task(&mut source, &mut destination, 1),
+        Err(SchedulerError::NoRunnableTasks)
+    );
+    assert_eq!(destination.tasks.iter().flatten().count(), 0);
+}
+
+#[test_case]
+fn migration_respects_affinity_and_competing_stealers_cannot_duplicate_a_task() {
+    let mut source = RunQueue::new();
+    let mut first_destination = RunQueue::new();
+    let mut second_destination = RunQueue::new();
+    let id = source
+        .create_task(CpuContext::empty())
+        .expect("create task to migrate");
+    let source_index = source
+        .tasks
+        .iter()
+        .position(|task| task.as_ref().is_some_and(|task| task.id == id))
+        .expect("find source task");
+
+    source.tasks[source_index]
+        .as_mut()
+        .expect("source task disappeared")
+        .cpu_affinity = Some(0);
+    assert_eq!(
+        migrate_ready_task(&mut source, &mut first_destination, 1),
+        Err(SchedulerError::NoRunnableTasks)
+    );
+
+    source.tasks[source_index]
+        .as_mut()
+        .expect("source task disappeared")
+        .cpu_affinity = Some(1);
+    assert_eq!(
+        migrate_ready_task(&mut source, &mut first_destination, 1),
+        Ok(id)
+    );
+    assert_eq!(
+        migrate_ready_task(&mut source, &mut second_destination, 2),
+        Err(SchedulerError::NoRunnableTasks)
+    );
+    assert_eq!(first_destination.task(id).unwrap().cpu_affinity, Some(1));
+    assert!(second_destination.task(id).is_err());
+}
+
+#[test_case]
+fn runqueue_load_counts_only_runnable_tasks() {
+    let mut scheduler = Scheduler::new();
+    let first = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create first task");
+    let second = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create second task");
+    let third = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create third task");
+
+    assert_eq!(scheduler.start(), Ok(first));
+    assert_eq!(scheduler.block_current(), Ok(second));
+    assert_eq!(scheduler.block_current(), Ok(third));
+    assert_eq!(runnable_task_count(&scheduler, 0), 1);
+    assert_eq!(
+        scheduler.sleep_current_until(10),
+        Err(SchedulerError::NoRunnableTasks)
+    );
+    assert_eq!(runnable_task_count(&scheduler, 0), 0);
+    assert_eq!(scheduler.wake(first), Ok(()));
+    assert_eq!(runnable_task_count(&scheduler, 0), 1);
+}
+
+#[test_case]
+fn scheduler_defers_reaping_until_a_switching_task_is_off_its_stack() {
+    let mut scheduler = Scheduler::new();
+    let switching = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create switching task");
+    let next = scheduler
+        .create_task(CpuContext::empty())
+        .expect("create next task");
+    assert_eq!(scheduler.start(), Ok(switching));
+    assert_eq!(scheduler.transition_current(TaskState::Ready), Ok(next));
+    scheduler.mark_switch_pending(0, 0);
+
+    assert_eq!(scheduler.request_terminate_task(switching, 143), Ok(true));
+    assert_eq!(
+        scheduler.reap_terminated(switching),
+        Err(SchedulerError::InvalidState)
+    );
+
+    scheduler.tasks[0]
+        .as_mut()
+        .expect("switching task disappeared")
+        .switch_pending_cpu = None;
+    assert_eq!(scheduler.reap_terminated(switching), Ok(()));
+}
+
+#[test_case]
+fn waking_a_task_in_a_remote_runqueue_makes_it_runnable() {
+    let mut remote_queue = Scheduler::new();
+    let remote_task = remote_queue
+        .create_task(CpuContext::empty())
+        .expect("create remote task");
+    assert_eq!(remote_queue.start(), Ok(remote_task));
+    assert_eq!(
+        remote_queue.block_current(),
+        Err(SchedulerError::NoRunnableTasks)
+    );
+    assert_eq!(remote_queue.current_task(), None);
+
+    assert_eq!(remote_queue.wake(remote_task), Ok(()));
+    assert_eq!(remote_queue.task_state(remote_task), Ok(TaskState::Ready));
+    assert_eq!(remote_queue.start(), Ok(remote_task));
+}
+
+#[test_case]
 fn scheduler_rejects_invalid_transitions_and_capacity_overflow() {
     let mut scheduler = Scheduler::new();
     let id = scheduler
@@ -1725,7 +2869,7 @@ fn scheduler_rejects_invalid_transitions_and_capacity_overflow() {
     assert_eq!(scheduler.start(), Err(SchedulerError::AlreadyStarted));
     assert_eq!(scheduler.wake(id), Err(SchedulerError::InvalidState));
 
-    for _ in 1..MAX_TASKS {
+    for _ in 1..PER_CORE_MAX_TASKS {
         scheduler
             .create_task(CpuContext::empty())
             .expect("fill scheduler");
@@ -1930,7 +3074,7 @@ fn scheduler_retains_terminated_tasks_until_reaped_and_then_reuses_the_slot() {
 #[test_case]
 fn scheduler_does_not_consume_task_ids_when_capacity_is_full_or_ids_are_exhausted() {
     let mut scheduler = Scheduler::new();
-    for _ in 0..MAX_TASKS {
+    for _ in 0..PER_CORE_MAX_TASKS {
         scheduler
             .create_task(CpuContext::empty())
             .expect("fill scheduler");
@@ -1958,7 +3102,7 @@ fn scheduler_does_not_consume_task_ids_when_capacity_is_full_or_ids_are_exhauste
 #[test_case]
 fn scheduler_preflights_kernel_task_capacity_and_id_before_stack_allocation() {
     let mut full = Scheduler::new();
-    for _ in 0..MAX_TASKS {
+    for _ in 0..PER_CORE_MAX_TASKS {
         full.create_task(CpuContext::empty())
             .expect("fill scheduler");
     }
@@ -1981,21 +3125,226 @@ fn scheduler_preflights_kernel_task_capacity_and_id_before_stack_allocation() {
 }
 
 #[test_case]
+fn fd_mappings_snapshot_sources_for_overlapping_permutations() {
+    let mut fds = fd::initial_table();
+    let (read_a, _write_a) = fd::create_pipe().expect("create first pipe");
+    let (read_b, _write_b) = fd::create_pipe().expect("create second pipe");
+    let pipe_a = match read_a {
+        FileDescriptor::PipeRead(ref pipe) => pipe.clone(),
+        _ => unreachable!(),
+    };
+    let pipe_b = match read_b {
+        FileDescriptor::PipeRead(ref pipe) => pipe.clone(),
+        _ => unreachable!(),
+    };
+    fds[3] = Some(read_a);
+    fds[4] = Some(read_b);
+
+    apply_fd_mappings(
+        &mut fds,
+        &[
+            FdMapping {
+                source: 3,
+                target: 4,
+            },
+            FdMapping {
+                source: 4,
+                target: 3,
+            },
+        ],
+        &[],
+    )
+    .expect("swap overlapping descriptors");
+
+    let points_to_pipe = |descriptor: &Option<FileDescriptor>, expected: &_| matches!(descriptor, Some(FileDescriptor::PipeRead(pipe)) if alloc::sync::Arc::ptr_eq(pipe, expected));
+    assert!(points_to_pipe(&fds[3], &pipe_b));
+    assert!(points_to_pipe(&fds[4], &pipe_a));
+}
+
+#[test_case]
+fn fd_mappings_repeated_destinations_use_last_mapping_and_close_sources() {
+    let mut fds = fd::initial_table();
+    let (read_a, _write_a) = fd::create_pipe().expect("create first pipe");
+    let (read_b, _write_b) = fd::create_pipe().expect("create second pipe");
+    let (old_destination, _old_writer) = fd::create_pipe().expect("create destination pipe");
+    let expected = match read_b {
+        FileDescriptor::PipeRead(ref pipe) => pipe.clone(),
+        _ => unreachable!(),
+    };
+    fds[3] = Some(read_a);
+    fds[4] = Some(read_b);
+    fds[5] = Some(old_destination);
+
+    apply_fd_mappings(
+        &mut fds,
+        &[
+            FdMapping {
+                source: 3,
+                target: 5,
+            },
+            FdMapping {
+                source: 4,
+                target: 5,
+            },
+        ],
+        &[],
+    )
+    .expect("apply repeated destination mappings");
+
+    assert!(fds[3].is_none());
+    assert!(fds[4].is_none());
+    assert!(matches!(
+        &fds[5],
+        Some(FileDescriptor::PipeRead(pipe)) if alloc::sync::Arc::ptr_eq(pipe, &expected)
+    ));
+    assert_eq!(fd::write(&_write_a, b"x"), Err(fd::WriteError::BrokenPipe));
+    assert_eq!(
+        fd::write(&_old_writer, b"x"),
+        Err(fd::WriteError::BrokenPipe)
+    );
+}
+
+#[test_case]
+fn invalid_fd_mappings_do_not_modify_the_descriptor_table() {
+    let mut fds = fd::initial_table();
+    let (reader, _writer) = fd::create_pipe().expect("create pipe");
+    let expected = match &reader {
+        FileDescriptor::PipeRead(pipe) => pipe.clone(),
+        _ => unreachable!(),
+    };
+    fds[3] = Some(reader);
+    let original_count = alloc::sync::Arc::strong_count(&expected);
+    for mapping in [
+        FdMapping {
+            source: MAX_FDS,
+            target: 0,
+        },
+        FdMapping {
+            source: 3,
+            target: MAX_FDS,
+        },
+        FdMapping {
+            source: 7,
+            target: 0,
+        },
+    ] {
+        assert_eq!(
+            apply_fd_mappings(&mut fds, &[mapping], &[]),
+            Err(SchedulerError::InvalidFd)
+        );
+        assert_eq!(alloc::sync::Arc::strong_count(&expected), original_count);
+        assert!(matches!(
+            &fds[3],
+            Some(FileDescriptor::PipeRead(pipe)) if alloc::sync::Arc::ptr_eq(pipe, &expected)
+        ));
+    }
+    assert_eq!(
+        apply_fd_mappings(
+            &mut fds,
+            &[
+                FdMapping {
+                    source: 3,
+                    target: 4,
+                },
+                FdMapping {
+                    source: 7,
+                    target: 5,
+                },
+            ],
+            &[],
+        ),
+        Err(SchedulerError::InvalidFd)
+    );
+    assert!(fds[4].is_none());
+    assert!(matches!(
+        &fds[3],
+        Some(FileDescriptor::PipeRead(pipe)) if alloc::sync::Arc::ptr_eq(pipe, &expected)
+    ));
+    assert_eq!(
+        apply_fd_mappings(&mut fds, &[], &[MAX_FDS]),
+        Err(SchedulerError::InvalidFd)
+    );
+    assert_eq!(alloc::sync::Arc::strong_count(&expected), original_count);
+}
+
+#[test_case]
+fn empty_fd_mappings_preserve_inherited_descriptors() {
+    let mut fds = fd::initial_table();
+    let (reader, _writer) = fd::create_pipe().expect("create pipe");
+    let expected = match &reader {
+        FileDescriptor::PipeRead(pipe) => pipe.clone(),
+        _ => unreachable!(),
+    };
+    fds[3] = Some(reader);
+    let original_count = alloc::sync::Arc::strong_count(&expected);
+
+    apply_fd_mappings(&mut fds, &[], &[]).expect("empty mapping list");
+
+    assert_eq!(alloc::sync::Arc::strong_count(&expected), original_count);
+    assert!(matches!(
+        &fds[3],
+        Some(FileDescriptor::PipeRead(pipe)) if alloc::sync::Arc::ptr_eq(pipe, &expected)
+    ));
+}
+
+#[test_case]
 fn scheduler_assigns_distinct_ready_tasks_to_secondary_cpus() {
-    let mut scheduler = Scheduler::new();
-    let first = scheduler
-        .create_task(CpuContext::empty())
+    let mut first_queue = RunQueue::new();
+    let mut second_queue = RunQueue::new();
+    let first = first_queue
+        .insert_task_with_id(TaskId(1), CpuContext::empty(), None, None, None, None, None)
         .expect("create first task");
-    let second = scheduler
-        .create_task(CpuContext::empty())
+    let second = second_queue
+        .insert_task_with_id(TaskId(2), CpuContext::empty(), None, None, None, None, None)
         .expect("create second task");
 
-    assert_eq!(scheduler.select_next(0, 0), Ok(first));
-    assert_eq!(scheduler.select_next(0, 1), Ok(second));
-    assert_eq!(scheduler.current_index(0), Some(0));
-    assert_eq!(scheduler.current_index(1), Some(1));
-    assert_eq!(scheduler.task_state(first), Ok(TaskState::Running));
-    assert_eq!(scheduler.task_state(second), Ok(TaskState::Running));
+    assert_eq!(first_queue.select_next(0, 0), Ok(first));
+    assert_eq!(second_queue.select_next(0, 1), Ok(second));
+    assert_eq!(first_queue.current, Some(0));
+    assert_eq!(second_queue.current, Some(0));
+    assert_eq!(first_queue.task_state(first), Ok(TaskState::Running));
+    assert_eq!(second_queue.task_state(second), Ok(TaskState::Running));
+}
+
+#[test_case]
+fn detached_tasks_have_no_parent_and_termination_is_deferred_if_running() {
+    let mut scheduler = Scheduler::new();
+    let first =
+        spawn_detached_into(&mut scheduler, dummy_kernel_task).expect("spawn detached shell task");
+    assert_eq!(scheduler.task(first).map(|task| task.parent), Ok(None));
+    assert_eq!(scheduler.select_next(0, 1), Ok(first));
+    assert_eq!(scheduler.request_terminate_task(first, 0), Ok(true));
+    let task = scheduler.task(first).expect("find requested task");
+    assert!(task.kill_pending);
+    assert!(task.auto_reap);
+    assert_eq!(task.state, TaskState::Running);
+
+    let mut queued = Scheduler::new();
+    let queued_task = spawn_detached_into(&mut queued, dummy_kernel_task)
+        .expect("spawn another detached shell task");
+    assert_eq!(queued.request_terminate_task(queued_task, 0), Ok(false));
+    let task = queued.task(queued_task).expect("find terminated task");
+    assert!(task.auto_reap);
+    assert_eq!(task.state, TaskState::Terminated);
+    assert_eq!(task.switch_pending_cpu, None);
+}
+
+#[test_case]
+fn new_task_stack_is_allocated_aligned_and_contains_its_entry() {
+    let (context, stack, stack_top) = create_task_stack().expect("allocate task stack");
+    let stack_start = stack.as_ptr() as usize;
+    let stack_end = stack_start + core::mem::size_of_val(&*stack);
+    let initial_stack = context.stack_pointer as usize;
+
+    assert_eq!(stack_start % STACK_ALIGNMENT, 0);
+    assert_eq!(initial_stack % STACK_ALIGNMENT, 0);
+    assert!(initial_stack >= stack_start);
+    assert!(initial_stack + core::mem::size_of::<u64>() <= stack_end);
+    assert_eq!(stack_top.as_u64() as usize, stack_end);
+    assert_eq!(
+        unsafe { (initial_stack as *const u64).read() },
+        task_trampoline as *const () as usize as u64
+    );
 }
 
 fn dummy_kernel_task() {}

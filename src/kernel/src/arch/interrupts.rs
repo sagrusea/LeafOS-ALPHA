@@ -36,6 +36,8 @@ static IDT: Lazy<InterruptDescriptorTable> = Lazy::new(|| {
     idt[InterruptIndex::Mouse.as_u8()].set_handler_fn(mouse_interrupt_handler);
     idt[PIC_2_OFFSET + 4].set_handler_fn(mouse_interrupt_handler);
     idt[crate::drivers::apic::RESCHEDULE_VECTOR].set_handler_fn(reschedule_ipi_handler);
+    idt.non_maskable_interrupt
+        .set_handler_fn(panic_stop_ipi_handler);
     idt.page_fault.set_handler_fn(page_fault_handler);
     idt
 });
@@ -44,13 +46,24 @@ pub fn init_idt() {
     IDT.load();
 }
 
+extern "x86-interrupt" fn panic_stop_ipi_handler(_stack_frame: InterruptStackFrame) {
+    x86_64::instructions::interrupts::disable();
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
 extern "x86-interrupt" fn reschedule_ipi_handler(stack_frame: InterruptStackFrame) {
     let from_user = interrupted_from_user(&stack_frame);
     if from_user {
         unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
     }
     crate::drivers::apic::eoi();
-    crate::tasking::scheduler::preempt_from_timer();
+    crate::smp::reschedule_ipi_received();
+    crate::tasking::scheduler::preempt_from_timer(
+        from_user.then_some(stack_frame.stack_pointer.as_u64()),
+        false,
+    );
     if from_user {
         unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
     }
@@ -95,7 +108,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         signal_eoi(InterruptIndex::Timer.as_u8() - PIC_1_OFFSET);
     }
 
-    crate::tasking::scheduler::preempt_from_timer();
+    crate::tasking::scheduler::preempt_from_timer(
+        from_user.then_some(stack_frame.stack_pointer.as_u64()),
+        true,
+    );
     if from_user {
         unsafe { core::arch::asm!("swapgs", options(nostack, preserves_flags)) };
     }
@@ -155,12 +171,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(stack_frame: InterruptStack
 
                         crate::tasking::scheduler::exit_current_group_with_code(130);
                     } else if user_task_running {
-                        crate::gui::push_key(byte);
+                        let _ = crate::gui::push_key(byte);
                         crate::drivers::input::enqueue(byte);
                         crate::tasking::scheduler::wake_all_blocked_tasks();
                     } else {
-                        crate::gui::push_key(byte);
-                        shell::enqueue_key(byte);
+                        if !crate::gui::push_key(byte) {
+                            shell::enqueue_key(byte);
+                        }
                         crate::tasking::scheduler::wake_all_blocked_tasks();
                     }
                 }
@@ -179,9 +196,13 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(stack_frame: InterruptStack
                 };
                 if let Some(key) = special_key {
                     if user_task_running {
+                        let _ = crate::gui::push_key(key);
                         crate::drivers::input::enqueue(key);
+                        crate::tasking::scheduler::wake_all_blocked_tasks();
                     } else {
-                        shell::enqueue_key(key);
+                        if !crate::gui::push_key(key) {
+                            shell::enqueue_key(key);
+                        }
                         crate::tasking::scheduler::wake_all_blocked_tasks();
                     }
                 }
