@@ -63,10 +63,10 @@ fn create_and_remove_ext2_directory_task() {
         .expect("remove directory in scheduled task");
 }
 
-fn map_test_user_program(code: &[u8]) -> (kernel::memory::AddressSpace, PhysAddr) {
-    use kernel::memory::{self, USER_SPACE_START, UserPageAccess};
+fn map_test_user_program(code: &[u8]) -> (kernel::mm::AddressSpace, PhysAddr) {
+    use kernel::mm::{self, USER_SPACE_START, UserPageAccess};
 
-    let mut address_space = memory::create_address_space().expect("create user test address space");
+    let mut address_space = mm::create_address_space().expect("create user test address space");
     let code_page = Page::containing_address(VirtAddr::new(USER_SPACE_START + 0x1000));
     let stack_page = Page::containing_address(VirtAddr::new(USER_SPACE_START + 0x3000));
     let code_frame = address_space
@@ -75,7 +75,7 @@ fn map_test_user_program(code: &[u8]) -> (kernel::memory::AddressSpace, PhysAddr
     address_space
         .map_user_page(stack_page, UserPageAccess::ReadWrite)
         .expect("map user test stack");
-    let offset = memory::with_manager(|manager| manager.physical_memory_offset())
+    let offset = mm::with_manager(|manager| manager.physical_memory_offset())
         .expect("get physical-memory offset");
     let code_virtual = VirtAddr::try_new(offset.as_u64() + code_frame.as_u64())
         .expect("direct-map user test code frame");
@@ -86,7 +86,7 @@ fn map_test_user_program(code: &[u8]) -> (kernel::memory::AddressSpace, PhysAddr
 }
 
 fn run_user_test_program(code: &[u8]) -> u64 {
-    use kernel::memory::USER_SPACE_START;
+    use kernel::mm::USER_SPACE_START;
 
     let (address_space, _code_frame) = map_test_user_program(code);
     let task = scheduler::spawn_user(
@@ -266,9 +266,9 @@ fn waking_kernel_task() {
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     BOOT_INFO.store(boot_info.cast_mut(), Ordering::Relaxed);
     if let Some(boot_info) = unsafe { BootInfo::from_ptr(boot_info) } {
-        unsafe { kernel::memory::initialize(boot_info) }.expect("initialize memory manager");
+        unsafe { kernel::mm::initialize(boot_info) }.expect("initialize memory manager");
         unsafe { kernel::fs::initialize(boot_info) }.expect("validate initrd");
-        unsafe { kernel::memory::heap::initialize() }.expect("initialize kernel heap");
+        unsafe { kernel::mm::heap::initialize() }.expect("initialize kernel heap");
         kernel::fs::ext2::initialize().expect("mount ext2 test disk");
     }
     kernel::init();
@@ -389,7 +389,7 @@ fn test_active_page_table_access() {
     );
 
     let kernel_address = VirtAddr::new(_start as *const () as usize as u64);
-    let physical_address = kernel::memory::with_manager(|manager| {
+    let physical_address = kernel::mm::with_manager(|manager| {
         let kernel_physical_address = manager
             .translate_addr(kernel_address)
             .expect("kernel test code is mapped");
@@ -410,7 +410,7 @@ fn test_active_page_table_access() {
 
 #[test_case]
 fn test_mapping_with_uefi_frame_allocator() {
-    kernel::memory::with_manager(|manager| {
+    kernel::mm::with_manager(|manager| {
         let page = manager
             .first_unused_low_half_page()
             .expect("an unused low-half page-table slot");
@@ -456,7 +456,7 @@ fn test_mapping_with_uefi_frame_allocator() {
 #[test_case]
 fn test_failed_mapping_reclaims_allocated_frame() {
     let kernel_page = Page::containing_address(VirtAddr::new(_start as *const () as usize as u64));
-    kernel::memory::with_manager(|manager| {
+    kernel::mm::with_manager(|manager| {
         let expected_frame = manager
             .allocate_frame()
             .expect("a conventional memory frame");
@@ -471,7 +471,7 @@ fn test_failed_mapping_reclaims_allocated_frame() {
         };
         assert!(matches!(
             result,
-            Err(kernel::memory::MappingError::Mapper(_))
+            Err(kernel::mm::MappingError::Mapper(_))
         ));
         assert_eq!(
             manager
@@ -857,11 +857,11 @@ fn test_scheduled_task_can_create_and_remove_ext2_directory() {
 
 #[test_case]
 fn test_address_spaces_isolate_user_pages_and_protect_shared_kernel_mappings() {
-    use kernel::memory::{self, USER_SPACE_START, UserPageAccess};
+    use kernel::mm::{self, USER_SPACE_START, UserPageAccess};
 
     let original_root = Cr3::read().0;
-    let mut first = memory::create_address_space().expect("create first address space");
-    let mut second = memory::create_address_space().expect("create second address space");
+    let mut first = mm::create_address_space().expect("create first address space");
+    let mut second = mm::create_address_space().expect("create second address space");
     let executable = Page::containing_address(VirtAddr::new(USER_SPACE_START + 0x1000));
     let data = Page::containing_address(VirtAddr::new(USER_SPACE_START + 0x2000));
     let stack_page = Page::containing_address(VirtAddr::new(USER_SPACE_START + 0x3000));
@@ -897,7 +897,7 @@ fn test_address_spaces_isolate_user_pages_and_protect_shared_kernel_mappings() {
         Err(kernel::arch::user::UserContextError::EntryNotExecutable)
     );
 
-    let physical_memory_offset = memory::with_manager(|manager| manager.physical_memory_offset())
+    let physical_memory_offset = mm::with_manager(|manager| manager.physical_memory_offset())
         .expect("read physical-memory offset");
     let first_root = first
         .root_physical_address()
@@ -915,7 +915,7 @@ fn test_address_spaces_isolate_user_pages_and_protect_shared_kernel_mappings() {
     assert!(user_flags[3].contains(PageTableFlags::WRITABLE));
     assert!(user_flags[3].contains(PageTableFlags::NO_EXECUTE));
     let kernel_page = Page::<x86_64::structures::paging::Size4KiB>::containing_address(
-        VirtAddr::from_ptr(memory::create_address_space as *const ()),
+        VirtAddr::from_ptr(mm::create_address_space as *const ()),
     );
     let kernel_root = original_root.start_address();
     let kernel_root_virtual =
@@ -964,7 +964,7 @@ fn test_address_spaces_isolate_user_pages_and_protect_shared_kernel_mappings() {
         observed_second = (USER_SPACE_START as *const u64)
             .add(0x2000 / core::mem::size_of::<u64>())
             .read_volatile();
-        memory::activate_kernel_address_space().expect("restore kernel address space");
+        mm::activate_kernel_address_space().expect("restore kernel address space");
     }
     if interrupts_were_enabled {
         x86_64::instructions::interrupts::enable();
@@ -977,7 +977,7 @@ fn test_address_spaces_isolate_user_pages_and_protect_shared_kernel_mappings() {
 
 #[test_case]
 fn test_scheduled_user_tasks_enter_syscall_exit_and_isolate_faults() {
-    use kernel::memory::USER_SPACE_START;
+    use kernel::mm::USER_SPACE_START;
 
     USER_TASK_DIAGNOSTICS_CONTINUED.store(false, Ordering::SeqCst);
     USER_TASK_KERNEL_ROOT.store(0, Ordering::SeqCst);
@@ -987,7 +987,7 @@ fn test_scheduled_user_tasks_enter_syscall_exit_and_isolate_faults() {
         0xb8, 0, 0, 0, 0, 0x0f, 0x05, 0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x8b, 0x18, 0x0f,
         0x0b,
     ];
-    let kernel_address = kernel::memory::create_address_space as *const () as u64;
+    let kernel_address = kernel::mm::create_address_space as *const () as u64;
     faulting_code[9..17].copy_from_slice(&kernel_address.to_le_bytes());
     let (faulting_space, faulting_code_frame) = map_test_user_program(&faulting_code);
 
@@ -1048,7 +1048,7 @@ fn test_scheduled_user_tasks_enter_syscall_exit_and_isolate_faults() {
 
 #[test_case]
 fn test_user_console_write_syscall_bounds_and_validates_user_memory() {
-    use kernel::{arch::syscall, memory::USER_SPACE_START};
+    use kernel::{arch::syscall, mm::USER_SPACE_START};
 
     // A readable user buffer produces the requested byte count and exercises
     // the actual console-write path from ring three.
@@ -1098,7 +1098,7 @@ fn test_user_console_write_syscall_bounds_and_validates_user_memory() {
 
 #[test_case]
 fn test_user_input_syscall_is_nonblocking_and_checks_writable_buffers() {
-    use kernel::{arch::syscall, drivers::input, memory::USER_SPACE_START};
+    use kernel::{arch::syscall, drivers::input, mm::USER_SPACE_START};
 
     // Start from a known queue state so this is deterministic even if the test
     // runner received keyboard events before the test began.
@@ -1148,7 +1148,7 @@ fn test_user_input_syscall_is_nonblocking_and_checks_writable_buffers() {
 
 #[test_case]
 fn test_user_file_read_syscall_reads_only_bounded_ext2_files() {
-    use kernel::{arch::syscall, fs::ext2, memory::USER_SPACE_START};
+    use kernel::{arch::syscall, fs::ext2, mm::USER_SPACE_START};
 
     const PATH: &[u8] = b"SYSCALL.TXT";
     ext2::write_file("SYSCALL.TXT", b"hello").expect("create file for syscall read test");
@@ -1192,7 +1192,7 @@ fn test_user_file_read_syscall_reads_only_bounded_ext2_files() {
 
 #[test_case]
 fn test_user_file_write_syscall_persists_bounded_ext2_files() {
-    use kernel::{arch::syscall, fs::ext2, memory::USER_SPACE_START};
+    use kernel::{arch::syscall, fs::ext2, mm::USER_SPACE_START};
 
     const PATH: &[u8] = b"SYSCALL-WRITE.TXT";
     const CONTENTS: &[u8] = b"written by ring three";
@@ -1226,7 +1226,7 @@ fn test_user_file_write_syscall_persists_bounded_ext2_files() {
 
 #[test_case]
 fn test_raw_user_program_can_be_relaunched_after_reaping() {
-    use kernel::memory::UserPageAccess;
+    use kernel::mm::UserPageAccess;
 
     assert!(matches!(
         kernel::user_program::load("apps/smoke.exe"),
@@ -1326,7 +1326,7 @@ fn test_parent_task_can_wait_for_and_reap_owned_user_app() {
 
 #[test_case]
 fn test_leaf_app_maps_code_and_data_and_exits_through_syscall() {
-    use kernel::memory::UserPageAccess;
+    use kernel::mm::UserPageAccess;
 
     let program = kernel::user_program::load("apps/smoke.app")
         .expect("load versioned LeafOS application from initrd");
@@ -1376,7 +1376,7 @@ fn test_c_app_runtime_passes_arguments_and_main_status() {
 
 #[test_case]
 fn test_leaf_app_loads_and_runs_from_ext2_data_disk() {
-    use kernel::memory::UserPageAccess;
+    use kernel::mm::UserPageAccess;
 
     let program = kernel::user_program::load_from_ext2("apps/smoke.app")
         .expect("load bounded LeafOS application from ext2");
@@ -1440,7 +1440,7 @@ fn test_user_app_receives_argument_count_and_vector() {
 #[test_case]
 fn test_user_app_can_spawn_with_arguments_and_wait() {
     use kernel::fs::ext2;
-    use kernel::memory::USER_SPACE_START;
+    use kernel::mm::USER_SPACE_START;
 
     const CHILD_CODE: &[u8] = &[
         0xbf, 42, 0, 0, 0, // mov edi, 42

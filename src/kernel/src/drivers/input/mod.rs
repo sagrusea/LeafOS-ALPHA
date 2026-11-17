@@ -5,6 +5,9 @@
 
 use crate::sync::Mutex;
 
+pub mod keyboard;
+pub mod mouse;
+
 pub const INPUT_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -82,3 +85,4 @@ mod tests {
         assert_eq!(full[INPUT_CAPACITY - 1], (INPUT_CAPACITY - 1) as u8);
     }
 }
+

@@ -1412,7 +1412,7 @@ fn print_system_overview() {
     );
     gop_println!(
         "Heap mapped: {} KiB",
-        crate::memory::heap::mapped_bytes() / 1024
+        crate::mm::heap::mapped_bytes() / 1024
     );
     gop_println!(
         "Scheduled tasks: {}/{}",
@@ -1559,7 +1559,7 @@ fn execute(
         }
         Command::Memory => gop_println!(
             "Heap mapped: {} KiB",
-            crate::memory::heap::mapped_bytes() / 1024
+            crate::mm::heap::mapped_bytes() / 1024
         ),
         Command::Uptime => {
             let (days, hours, minutes, seconds) =

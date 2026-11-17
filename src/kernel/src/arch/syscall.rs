@@ -1,4 +1,4 @@
-use crate::{gdt, memory};
+use crate::{gdt, mm};
 use core::arch::global_asm;
 use core::ptr::addr_of_mut;
 use x86_64::VirtAddr;
@@ -236,8 +236,8 @@ syscall_bad_return:
     call leafos_invalid_syscall_return
     ud2
     "#,
-    user_space_start = const memory::USER_SPACE_START,
-    user_space_end = const memory::USER_SPACE_END,
+    user_space_start = const mm::USER_SPACE_START,
+    user_space_end = const mm::USER_SPACE_END,
     rflags_user_mask = const RFLAGS_USER_MASK,
     kernel_data_selector = const gdt::KERNEL_DATA_SELECTOR,
     user_data_selector = const gdt::USER_DATA_SELECTOR,

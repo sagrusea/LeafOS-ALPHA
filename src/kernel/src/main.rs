@@ -26,7 +26,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
     };
 
-    if let Err(error) = unsafe { kernel::memory::initialize(boot_info) } {
+    if let Err(error) = unsafe { kernel::mm::initialize(boot_info) } {
         serial_println!("[FATAL] Memory initialization failed: {:?}", error);
         kernel::hlt_loop();
     }
@@ -49,7 +49,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     serial_println!("[OK] Read-only initrd mounted");
 
-    if let Err(error) = unsafe { kernel::memory::heap::initialize() } {
+    if let Err(error) = unsafe { kernel::mm::heap::initialize() } {
         serial_println!("[FATAL] Heap initialization failed: {:?}", error);
         kernel::hlt_loop();
     }

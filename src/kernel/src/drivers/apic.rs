@@ -1,5 +1,5 @@
 use super::acpi;
-use crate::memory;
+use crate::mm;
 use crate::sync::{Mutex, Once};
 use core::sync::atomic::{AtomicUsize, Ordering};
 use x86::msr::{IA32_APIC_BASE, rdmsr, wrmsr};
@@ -41,8 +41,8 @@ unsafe impl Send for Apic {}
 impl Apic {
     fn new(info: acpi::ApicInfo) -> Option<Self> {
         let local_base = info.local_apic_address;
-        let local = memory::map_mmio_page(local_base).ok()?.as_mut_ptr::<u32>();
-        let io = memory::map_mmio_page(info.io_apic_address)
+        let local = mm::map_mmio_page(local_base).ok()?.as_mut_ptr::<u32>();
+        let io = mm::map_mmio_page(info.io_apic_address)
             .ok()?
             .as_mut_ptr::<u32>();
         Some(Self {

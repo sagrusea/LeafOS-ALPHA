@@ -1,5 +1,5 @@
 use crate::arch::user::{UserContext, UserContextError};
-use crate::memory::{self, AddressSpace};
+use crate::mm::{self, AddressSpace};
 #[cfg(test)]
 use crate::serial_println;
 use crate::sync::Mutex;
@@ -1289,7 +1289,7 @@ fn destroy_unspawned_address_space(
 
 fn activate_task_address_space(scheduler: &Scheduler, index: Option<usize>) {
     let Some(index) = index else {
-        unsafe { memory::activate_kernel_address_space() }
+        unsafe { mm::activate_kernel_address_space() }
             .expect("restore kernel address space before bootstrap");
         return;
     };
@@ -1304,7 +1304,7 @@ fn activate_task_address_space(scheduler: &Scheduler, index: Option<usize>) {
         unsafe { crate::arch::syscall::set_user_rsp(user.syscall_user_rsp) };
         unsafe { user.address_space.activate() }.expect("activate selected user address space");
     } else {
-        unsafe { memory::activate_kernel_address_space() }
+        unsafe { mm::activate_kernel_address_space() }
             .expect("activate kernel address space for kernel task");
     }
 }
@@ -1868,13 +1868,13 @@ pub fn validate_current_user_range(
     address: u64,
     length: usize,
     writable: bool,
-) -> Result<(), memory::UserMemoryError> {
+) -> Result<(), mm::UserMemoryError> {
     let scheduler = current_runqueue().lock();
     let task = scheduler
         .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .and_then(|task| task.user.as_ref())
-        .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
+        .ok_or(mm::UserMemoryError::InactiveAddressSpace)?;
     task.address_space
         .validate_user_range(address, length, writable)
 }
@@ -1883,24 +1883,24 @@ pub fn validate_current_user_range(
 pub fn copy_from_current_user(
     address: u64,
     output: &mut [u8],
-) -> Result<(), memory::UserMemoryError> {
+) -> Result<(), mm::UserMemoryError> {
     let scheduler = current_runqueue().lock();
     let task = scheduler
         .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .and_then(|task| task.user.as_ref())
-        .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
+        .ok_or(mm::UserMemoryError::InactiveAddressSpace)?;
     task.address_space.copy_from_user(address, output)
 }
 
 /// Copy syscall output to a writable buffer in the currently running task.
-pub fn copy_to_current_user(address: u64, input: &[u8]) -> Result<(), memory::UserMemoryError> {
+pub fn copy_to_current_user(address: u64, input: &[u8]) -> Result<(), mm::UserMemoryError> {
     let scheduler = current_runqueue().lock();
     let task = scheduler
         .current_index(current_runqueue_index())
         .and_then(|index| scheduler.tasks[index].as_ref())
         .and_then(|task| task.user.as_ref())
-        .ok_or(memory::UserMemoryError::InactiveAddressSpace)?;
+        .ok_or(mm::UserMemoryError::InactiveAddressSpace)?;
     task.address_space.copy_to_user(address, input)
 }
 

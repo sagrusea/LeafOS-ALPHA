@@ -1,6 +1,7 @@
-pub mod framebuffer;
 pub mod serial;
 pub mod vga_buffer;
+
+pub use crate::drivers::gpu::framebuffer;
 
 /// Write a bounded byte buffer to the active text console. Use the framebuffer
 /// for interactive boots and serial as a fallback for headless/test boots.

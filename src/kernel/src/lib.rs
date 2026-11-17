@@ -11,23 +11,23 @@ use core::panic::PanicInfo;
 use x86::io::{outl, outw};
 
 pub mod arch;
-pub mod boot_info;
+pub mod boot;
 pub mod console;
 pub mod drivers;
 pub mod fs;
 pub mod gui;
-pub mod memory;
-pub mod misc;
+pub mod mm;
 pub mod shell;
-pub mod smp;
 pub mod sync;
 pub mod tasking;
 pub mod time;
-pub mod user_program;
 
 pub use arch::{gdt, interrupts};
-pub use console::{framebuffer, serial, vga_buffer};
-pub use tasking::scheduler;
+pub use arch::smp;
+pub use boot::info as boot_info;
+pub use console::{serial, vga_buffer};
+pub use drivers::gpu::framebuffer;
+pub use tasking::{scheduler, user_program};
 pub use time::timer;
 
 pub trait Testable {
@@ -68,9 +68,9 @@ pub fn test_panic_handler(info: &PanicInfo) -> ! {
 pub extern "C" fn _start(boot_info: *const boot_info::BootInfo) -> ! {
     let boot_info = unsafe { boot_info::BootInfo::from_ptr(boot_info) }
         .expect("test boot requires valid BootInfo");
-    unsafe { memory::initialize(boot_info) }.expect("initialize physical memory manager");
+    unsafe { mm::initialize(boot_info) }.expect("initialize physical memory manager");
     drivers::acpi::initialize(boot_info.acpi_rsdp, boot_info.physical_memory_offset);
-    unsafe { memory::heap::initialize() }.expect("initialize kernel heap");
+    unsafe { mm::heap::initialize() }.expect("initialize kernel heap");
     init();
     test_main();
     hlt_loop();

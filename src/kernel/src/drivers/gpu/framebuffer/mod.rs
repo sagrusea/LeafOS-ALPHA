@@ -1,11 +1,13 @@
 use crate::boot_info::{self, BootInfo};
-use crate::misc::font::get_glyph;
 use crate::sync::{Mutex, Once};
+use font::get_glyph;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt;
 use core::ptr::NonNull;
+
+mod font;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FramebufferBuffer {

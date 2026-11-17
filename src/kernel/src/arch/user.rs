@@ -1,4 +1,4 @@
-use crate::{gdt, memory};
+use crate::{gdt, mm};
 use core::arch::asm;
 use x86_64::VirtAddr;
 
@@ -29,14 +29,14 @@ impl UserContext {
         argument_count: u64,
         argument_vector: VirtAddr,
     ) -> Result<Self, UserContextError> {
-        if !memory::AddressSpace::contains_user_address(entry) {
+        if !mm::AddressSpace::contains_user_address(entry) {
             return Err(UserContextError::InvalidEntry);
         }
-        if !memory::AddressSpace::contains_user_address(stack) || !stack.as_u64().is_multiple_of(16)
+        if !mm::AddressSpace::contains_user_address(stack) || !stack.as_u64().is_multiple_of(16)
         {
             return Err(UserContextError::InvalidStack);
         }
-        if argument_count != 0 && !memory::AddressSpace::contains_user_address(argument_vector) {
+        if argument_count != 0 && !mm::AddressSpace::contains_user_address(argument_vector) {
             return Err(UserContextError::InvalidStack);
         }
         Ok(Self {
@@ -48,7 +48,7 @@ impl UserContext {
     }
 
     pub fn for_address_space(
-        address_space: &memory::AddressSpace,
+        address_space: &mm::AddressSpace,
         entry: VirtAddr,
         stack: VirtAddr,
     ) -> Result<Self, UserContextError> {
@@ -56,7 +56,7 @@ impl UserContext {
     }
 
     pub fn for_address_space_with_arguments(
-        address_space: &memory::AddressSpace,
+        address_space: &mm::AddressSpace,
         entry: VirtAddr,
         stack: VirtAddr,
         argument_count: u64,
@@ -67,15 +67,15 @@ impl UserContext {
         let stack_page =
             x86_64::structures::paging::Page::containing_address(VirtAddr::new(stack.as_u64() - 1));
         let argument_page = x86_64::structures::paging::Page::containing_address(argument_vector);
-        if address_space.user_page_access(entry_page) != Some(memory::UserPageAccess::ReadExecute) {
+        if address_space.user_page_access(entry_page) != Some(mm::UserPageAccess::ReadExecute) {
             return Err(UserContextError::EntryNotExecutable);
         }
-        if address_space.user_page_access(stack_page) != Some(memory::UserPageAccess::ReadWrite) {
+        if address_space.user_page_access(stack_page) != Some(mm::UserPageAccess::ReadWrite) {
             return Err(UserContextError::StackNotWritable);
         }
         if argument_count != 0
             && address_space.user_page_access(argument_page)
-                != Some(memory::UserPageAccess::ReadWrite)
+                != Some(mm::UserPageAccess::ReadWrite)
         {
             return Err(UserContextError::StackNotWritable);
         }
@@ -130,7 +130,7 @@ mod tests {
         );
         assert_eq!(
             UserContext::new(
-                VirtAddr::new(memory::USER_SPACE_START),
+                VirtAddr::new(mm::USER_SPACE_START),
                 VirtAddr::new(0x4000),
             ),
             Err(UserContextError::InvalidStack)
@@ -139,8 +139,8 @@ mod tests {
 
     #[test_case]
     fn user_context_requires_aligned_stack() {
-        let entry = VirtAddr::new(memory::USER_SPACE_START + 0x1000);
-        let stack = VirtAddr::new(memory::USER_SPACE_START + 0x2008);
+        let entry = VirtAddr::new(mm::USER_SPACE_START + 0x1000);
+        let stack = VirtAddr::new(mm::USER_SPACE_START + 0x2008);
         assert_eq!(
             UserContext::new(entry, stack),
             Err(UserContextError::InvalidStack)

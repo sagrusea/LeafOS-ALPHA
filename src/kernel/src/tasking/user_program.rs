@@ -1,4 +1,4 @@
-use crate::memory::{
+use crate::mm::{
     self, AddressSpace, AddressSpaceError, MemoryError, USER_SPACE_START, UserPageAccess,
 };
 use crate::scheduler::{self, SchedulerError, TaskId};
@@ -429,8 +429,8 @@ fn load_segments(
         .try_reserve_exact(stack_page_count)
         .map_err(|_| ProgramError::AddressSpace(AddressSpaceError::AllocationFailed))?;
 
-    let mut address_space = memory::create_address_space().map_err(ProgramError::AddressSpace)?;
-    let physical_offset = match memory::with_manager(|manager| manager.physical_memory_offset()) {
+    let mut address_space = mm::create_address_space().map_err(ProgramError::AddressSpace)?;
+    let physical_offset = match mm::with_manager(|manager| manager.physical_memory_offset()) {
         Ok(offset) => offset,
         Err(error) => {
             address_space
